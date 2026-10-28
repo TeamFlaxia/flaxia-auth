@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { cors } from 'hono/cors';
 import { bodyLimit } from 'hono/body-limit';
-import { isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, serverStep2 } from './srp';
+import { computeVerifier, generateSalt, isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, serverStep2 } from './srp';
 import { originAllowed } from './origin';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -19,7 +19,7 @@ const expiry = (ms: number) => new Date(Date.now() + ms).toISOString();
 const cookieName = '__Host-flaxia_session';
 const cookieOptions = { httpOnly: true, secure: true, sameSite: 'Lax' as const, path: '/' };
 
-type User = { id: string; username: string; display_name: string; srp_salt: string | null; srp_verifier: string | null; srp_kdf: string | null; frozen_at: string | null };
+type User = { id: string; username: string; display_name: string; password_hash: string; srp_salt: string | null; srp_verifier: string | null; srp_kdf: string | null; frozen_at: string | null };
 type Handshake = { user_id: string; b_scalar: string; b_pub: string };
 type SrpProof = { challenge_id?: unknown; A?: unknown; M1?: unknown };
 
@@ -30,6 +30,17 @@ async function rateLimit(db: D1Database, key: string, limit: number): Promise<bo
     window_start = CASE WHEN window_start <= ? - 60 THEN ? ELSE window_start END RETURNING attempts`)
     .bind(key, now, now, now, now).first<{ attempts: number }>();
   return !result || result.attempts > limit;
+}
+
+async function verifyLegacyPassword(password: string, stored: string): Promise<boolean> {
+  let combined: Uint8Array;
+  try { combined = dec(stored); } catch { return false; }
+  if (combined.length !== 48 || enc(combined) !== stored) return false;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const actual = new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: combined.slice(0, 16) as BufferSource, iterations: 100_000 }, key, 256));
+  let difference = 0;
+  for (let i = 0; i < 32; i++) difference |= actual[i] ^ combined[i + 16];
+  return difference === 0;
 }
 
 async function sessionUser(db: D1Database, token: string | undefined): Promise<User | null> {
@@ -49,29 +60,6 @@ async function verifyProof(db: D1Database, user: User, input: unknown): Promise<
   } catch { return false; }
 }
 app.get('/health', c => c.json({ service: 'flaxia-auth', status: 'ok' }));
-
-// The existing Flaxia service sends only the newly created SRP verifier, signed
-// with a shared secret, after it has verified the legacy account's password.
-app.post('/api/internal/legacy-sync', bodyLimit({ maxSize: 2048 }), async c => {
-  const secret = (c.env as Env & { LEGACY_SYNC_SECRET?: string }).LEGACY_SYNC_SECRET;
-  const timestamp = c.req.header('X-Flaxia-Timestamp');
-  const signature = c.req.header('X-Flaxia-Signature');
-  if (!secret || secret.length < 32 || !timestamp || !/^\d{10}$/.test(timestamp) || !signature || !/^[A-Za-z0-9_-]{43}$/.test(signature) || Math.abs(Date.now() / 1000 - Number(timestamp)) > 120) return c.json({ error: 'Unauthorized' }, 401);
-  const raw = await c.req.text();
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
-  let valid = false;
-  try { valid = await crypto.subtle.verify('HMAC', key, dec(signature.replaceAll('-', '+').replaceAll('_', '/')), new TextEncoder().encode(`${timestamp}.${raw}`)); } catch { /* invalid signature */ }
-  if (!valid) return c.json({ error: 'Unauthorized' }, 401);
-  let body: { user_id?: unknown; salt?: unknown; verifier?: unknown; group?: unknown; kdf?: unknown };
-  try { body = JSON.parse(raw); } catch { return c.json({ error: 'Invalid request' }, 400); }
-  if (!body || typeof body !== 'object' || typeof body.user_id !== 'string' || body.user_id.length > 128 || typeof body.salt !== 'string' || body.salt.length > 32 || typeof body.verifier !== 'string' || body.verifier.length > 400 || body.group !== '2048' || !isCreatableSrpKdf(body.kdf)) return c.json({ error: 'Invalid request' }, 400);
-  if (!validCredentials(body.salt, body.verifier)) return c.json({ error: 'Invalid request' }, 400);
-  const update = await c.env.DB.prepare("UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = '' WHERE id = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND password_hash <> '' AND frozen_at IS NULL")
-    .bind(body.salt, body.verifier, body.group, body.kdf, body.user_id).run();
-  if (update.meta.changes === 1) return c.json({ success: true });
-  const same = await c.env.DB.prepare("SELECT id FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ? AND srp_group = ? AND srp_kdf = ? AND frozen_at IS NULL").bind(body.user_id, body.salt, body.verifier, body.group, body.kdf).first();
-  return same ? c.json({ success: true }) : c.json({ error: 'Account unavailable' }, 409);
-});
 
 app.use('/api/auth/*', cors({ origin: origin => originAllowed(origin) ? origin : '', credentials: true, allowMethods: ['GET', 'POST', 'OPTIONS'], allowHeaders: ['Content-Type'] }));
 app.use('/api/auth/*', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'Request too large' }, 413) }));
@@ -105,6 +93,27 @@ app.post('/api/auth/register', async c => {
   } catch { return c.json({ error: 'Registration failed' }, 409); }
 });
 
+// This temporary endpoint accepts a password only for pre-SRP accounts.
+// Successful verification immediately replaces the old hash with an SRP verifier.
+app.post('/api/auth/login/legacy', async c => {
+  let body: { username?: unknown; password?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.username !== 'string' || !/^[a-zA-Z0-9_]{1,20}$/.test(body.username) || typeof body.password !== 'string' || body.password.length === 0 || body.password.length > 1024) return c.json({ error: 'Invalid request' }, 400);
+  if (await rateLimit(c.env.DB, `legacy-login:user:${body.username.toLowerCase()}`, 5)) return c.json({ error: 'Too many requests' }, 429);
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').bind(body.username).first<User>();
+  if (!user || user.srp_salt !== null || user.srp_verifier !== null || !user.password_hash || !await verifyLegacyPassword(body.password, user.password_hash)) return c.json({ error: 'Invalid credentials' }, 401);
+  if (user.frozen_at) return c.json({ error: 'account_frozen', username: user.username }, 403);
+  const salt = generateSalt();
+  const verifier = await computeVerifier(body.password, salt, 'pbkdf2-600k-v2');
+  const updated = await c.env.DB.prepare("UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = '2048', srp_kdf = 'pbkdf2-600k-v2', password_hash = '' WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL RETURNING id, username, display_name")
+    .bind(enc(salt), enc(verifier), user.id, user.password_hash).first<{ id: string; username: string; display_name: string }>();
+  if (!updated) return c.json({ error: 'Invalid credentials' }, 401);
+  const token = random();
+  await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)').bind(token, updated.id, expiry(7 * 86400000)).run();
+  setCookie(c, cookieName, token, { ...cookieOptions, maxAge: 7 * 86400 });
+  return c.json({ user: updated });
+});
+
 app.post('/api/auth/login/start', async c => {
   let body: { username?: unknown };
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
@@ -112,6 +121,7 @@ app.post('/api/auth/login/start', async c => {
   const byUsername = typeof body.username === 'string' && /^[a-zA-Z0-9_]{1,20}$/.test(body.username);
   if (!byUsername) return c.json({ error: 'Invalid credentials' }, 400);
   const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').bind(body.username).first<User>();
+  if (user && user.srp_salt === null && user.srp_verifier === null && user.password_hash) return c.json({ srp: false });
   if (!user?.srp_salt || !user.srp_verifier || !isSupportedSrpKdf(user.srp_kdf ?? 'sha256-v1')) return c.json({ error: 'Invalid credentials' }, 401);
   if (await rateLimit(c.env.DB, `login-start:user:${user.id}`, 5)) return c.json({ error: 'Too many requests' }, 429);
   const { B, b } = await serverStep1(dec(user.srp_salt), dec(user.srp_verifier));

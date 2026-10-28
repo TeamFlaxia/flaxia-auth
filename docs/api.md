@@ -6,7 +6,7 @@ Base URL: `https://auth.flaxia.app`
 
 ブラウザからのリクエストは `credentials: 'include'` を指定します。許可するOriginは `https://auth.flaxia.app` と `https://flaxia.app` です。POSTには許可された `Origin` が必要です。レスポンスの認証Cookieは `__Host-flaxia_session`、`Secure`、`HttpOnly`、`SameSite=Lax` で、有効期間は7日です。
 
-リクエストとレスポンスはJSONです。パスワードは送信せず、クライアントでSRPの値を計算します。文字列のバイナリ値は標準Base64です。SRPの計算は `src/srp.ts` を参照してください。新規の検証子には `srp_group: "2048"` と `srp_kdf: "pbkdf2-600k-v2"` を使用します。
+リクエストとレスポンスはJSONです。SRPではパスワードを送信せず、クライアントでSRPの値を計算します。旧方式の初回ログインのみ例外です。文字列のバイナリ値は標準Base64です。SRPの計算は `src/srp.ts` を参照してください。新規の検証子には `srp_group: "2048"` と `srp_kdf: "pbkdf2-600k-v2"` を使用します。
 
 | Method | Path | 用途 |
 | --- | --- | --- |
@@ -14,6 +14,7 @@ Base URL: `https://auth.flaxia.app`
 | POST | `/api/auth/register` | アカウント登録 |
 | POST | `/api/auth/login/start` | SRPログインの開始 |
 | POST | `/api/auth/login/verify` | SRP証明の検証とセッション発行 |
+| POST | `/api/auth/login/legacy` | 旧方式のログインとSRPへの移行 |
 | GET | `/api/auth/me` | 現在のユーザー取得 |
 | POST | `/api/auth/logout` | セッション削除 |
 | POST | `/api/auth/reauth/start` | 現在のユーザーの再認証を開始 |
@@ -55,4 +56,6 @@ Base URL: `https://auth.flaxia.app`
 
 ## 制限と旧方式
 
-認証APIはリクエスト元IPごとに各パスで毎分20回、ログイン開始はユーザーごとに毎分5回までです。超過時は429を返します。旧パスワード方式のアカウントは、SRPへ変換されるまでこのログインAPIを使えません。
+認証APIはリクエスト元IPごとに各パスで毎分20回、SRPログイン開始と旧方式ログインはそれぞれユーザーごとに毎分5回までです。超過時は429を返します。
+
+`/api/auth/login/start` が `{ "srp": false }` を返した場合に限り、旧方式のアカウントとして `POST /api/auth/login/legacy` に `{ "username", "password" }` を送り、初回のみ既存パスワードでログインします。成功すると同じパスワードのSRP検証子を作成し、旧ハッシュを削除してセッションを発行します。以後はSRPログインを使ってください。既にSRPへ移行済みのアカウントはこのエンドポイントを使えません。

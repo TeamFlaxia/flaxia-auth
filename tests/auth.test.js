@@ -48,6 +48,20 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   assert.ok(ready, `Worker failed to start: ${output}`);
+  const bridgePort = await freePort();
+  const bridgeProxy = spawn(process.execPath, [wrangler, 'dev', '--local', '--config', 'tests/fixtures/bridge-proxy.jsonc', '--ip', '127.0.0.1', '--port', String(bridgePort), '--inspector-port', '0'], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: 'true' } });
+  let bridgeOutput = '';
+  bridgeProxy.stdout.on('data', data => { bridgeOutput += data; });
+  bridgeProxy.stderr.on('data', data => { bridgeOutput += data; });
+  t.after(async () => { if (bridgeProxy.exitCode === null) { bridgeProxy.kill('SIGTERM'); await new Promise(resolve => bridgeProxy.once('exit', resolve)); } });
+  const bridgeBase = `http://127.0.0.1:${bridgePort}`;
+  let bridgeReady = false;
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(`${bridgeBase}/health`)).ok) { bridgeReady = true; break; } } catch {}
+    if (bridgeProxy.exitCode !== null) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.ok(bridgeReady, `Service binding failed to start: ${bridgeOutput}`);
   const request = (path, { method = 'POST', body, cookie, origin = 'https://flaxia.app', ip = '192.0.2.1' } = {}) => fetch(`${base}${path}`, {
     method, headers: { origin, 'CF-Connecting-IP': ip, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { cookie } : {}) },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -173,6 +187,39 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   const convertedResult = await convertedLogin.json();
   assert.equal(convertedResult.user.id, 'needs-upgrade');
   assert.equal(await verifyServerProof(convertedProof.A, convertedProof.M1, convertedProof.K, decode(convertedResult.M2)), true);
+  const authCookie = convertedLogin.headers.get('set-cookie').split(';')[0];
+  const pkceVerifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
+  const pkceChallenge = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pkceVerifier))).toString('base64url');
+  const authorize = await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: pkceChallenge }, ip: '192.0.2.13' });
+  assert.equal(authorize.status, 200);
+  const { code } = await authorize.json();
+  const exchange = async verifier => fetch(`${bridgeBase}/api/flaxia/exchange`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, verifier }) });
+  assert.equal((await fetch(`${base}/api/flaxia/exchange`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, verifier: pkceVerifier }) })).status, 404);
+  assert.equal((await exchange('x'.repeat(43))).status, 401);
+  const redeemed = await exchange(pkceVerifier);
+  assert.equal(redeemed.status, 200);
+  const grant = await redeemed.json();
+  assert.equal(grant.user_id, 'needs-upgrade');
+  assert.match(grant.credential_stamp, /^[A-Za-z0-9_-]{43}$/);
+  const legacyStamp = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(['legacy', legacyHash])))).toString('base64url');
+  assert.equal(grant.legacy_stamp, legacyStamp);
+  assert.equal((await exchange(pkceVerifier)).status, 401);
+  const introspect = () => fetch(`${bridgeBase}/api/flaxia/introspect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant: grant.grant }) });
+  const activeGrant = await introspect();
+  assert.equal(activeGrant.status, 200);
+  assert.equal((await activeGrant.json()).credential_stamp, grant.credential_stamp);
+  const bridgePost = (path, body) => fetch(`${bridgeBase}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  assert.equal((await bridgePost('/api/flaxia/reauth/start', { grant: grant.grant, user_id: 'wrong-user' })).status, 401);
+  const bridgeReauth = await bridgePost('/api/flaxia/reauth/start', { grant: grant.grant, user_id: grant.user_id });
+  assert.equal(bridgeReauth.status, 200);
+  const reauthChallenge = await bridgeReauth.json();
+  const bridgeFirst = await clientStep1(legacyPassword, decode(reauthChallenge.salt));
+  const bridgeProof = await clientStep2(legacyPassword, decode(reauthChallenge.salt), bridgeFirst.a, decode(reauthChallenge.B), reauthChallenge.srp_kdf);
+  const bridgeBody = { grant: grant.grant, user_id: grant.user_id, challenge_id: reauthChallenge.challenge_id, A: encode(bridgeProof.A), M1: encode(bridgeProof.M1) };
+  assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', bridgeBody)).json()).valid, true);
+  assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', bridgeBody)).json()).valid, false);
+  assert.equal((await request('/api/auth/logout', { cookie: authCookie, ip: '192.0.2.13' })).status, 200);
+  assert.equal((await introspect()).status, 401);
   const races = await Promise.all([1, 2].map(i => request(legacyEndpoint, { body: { username: 'RaceUser', password: legacyPassword }, ip: `192.0.2.${40 + i}` })));
   assert.deepEqual(races.map(r => r.status).sort(), [200, 401]);
   for (let i = 0; i < 4; i++) assert.equal((await request('/api/auth/login/start', { body: { username: 'legacyuser' }, ip: `192.0.2.${30 + i}` })).status, 200);

@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { WorkerEntrypoint } from 'cloudflare:workers';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { cors } from 'hono/cors';
 import { bodyLimit } from 'hono/body-limit';
@@ -6,6 +7,7 @@ import { computeVerifier, generateSalt, isCreatableSrpKdf, isSupportedSrpKdf, is
 import { originAllowed } from './origin';
 
 const app = new Hono<{ Bindings: Env }>();
+const bridge = new Hono<{ Bindings: Env }>();
 const enc = (data: Uint8Array) => btoa(String.fromCharCode(...data));
 const dec = (value: string) => Uint8Array.from(atob(value), c => c.charCodeAt(0));
 const validCredentials = (salt: string, verifier: string): boolean => {
@@ -15,11 +17,12 @@ const validCredentials = (salt: string, verifier: string): boolean => {
   } catch { return false; }
 };
 const random = () => enc(crypto.getRandomValues(new Uint8Array(32))).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+const sha256url = async (value: string) => enc(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
 const expiry = (ms: number) => new Date(Date.now() + ms).toISOString();
 const cookieName = '__Host-flaxia_session';
 const cookieOptions = { httpOnly: true, secure: true, sameSite: 'Lax' as const, path: '/' };
 
-type User = { id: string; username: string; display_name: string; password_hash: string; srp_salt: string | null; srp_verifier: string | null; srp_kdf: string | null; frozen_at: string | null };
+type User = { id: string; username: string; display_name: string; password_hash: string; srp_salt: string | null; srp_verifier: string | null; srp_group: string | null; srp_kdf: string | null; frozen_at: string | null };
 type Handshake = { user_id: string; b_scalar: string; b_pub: string };
 type SrpProof = { challenge_id?: unknown; A?: unknown; M1?: unknown };
 
@@ -60,6 +63,96 @@ async function verifyProof(db: D1Database, user: User, input: unknown): Promise<
   } catch { return false; }
 }
 app.get('/health', c => c.json({ service: 'flaxia-auth', status: 'ok' }));
+
+async function credentialStamp(db: D1Database, userId: string): Promise<string | null> {
+  const user = await db.prepare('SELECT srp_salt, srp_verifier, srp_group, srp_kdf FROM users WHERE id = ? AND frozen_at IS NULL').bind(userId).first<User>();
+  if (!user?.srp_salt || !user.srp_verifier || !user.srp_group) return null;
+  return sha256url(JSON.stringify([user.srp_salt, user.srp_verifier, user.srp_group, user.srp_kdf ?? 'sha256-v1']));
+}
+
+async function userForGrant(db: D1Database, grant: unknown): Promise<User | null> {
+  if (typeof grant !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(grant)) return null;
+  return db.prepare(`SELECT u.* FROM flaxia_session_grants g
+    JOIN sessions s ON s.id = g.session_id AND s.user_id = g.user_id
+    JOIN users u ON u.id = g.user_id
+    WHERE g.token_hash = ? AND s.expires_at > ? AND u.frozen_at IS NULL`).bind(await sha256url(grant), new Date().toISOString()).first<User>();
+}
+
+// A one-time code is bound to a client-generated verifier, so intercepting it
+// alone cannot create a Flaxia session.
+bridge.get('/health', c => c.json({ status: 'ok' }));
+bridge.post('/api/flaxia/exchange', bodyLimit({ maxSize: 1024 }), async c => {
+  c.header('Cache-Control', 'no-store');
+  let body: { code?: unknown; verifier?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || typeof body.code !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.code) || typeof body.verifier !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.verifier)) return c.json({ error: 'Invalid request' }, 400);
+  const codeHash = await sha256url(body.code);
+  const challenge = await sha256url(body.verifier);
+  const now = new Date().toISOString();
+  const grant = random();
+  const grantHash = await sha256url(grant);
+  const result = await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO flaxia_session_grants (token_hash, session_id, user_id)
+      SELECT ?, c.session_id, c.user_id FROM flaxia_authorization_codes c
+      JOIN sessions s ON s.id = c.session_id AND s.user_id = c.user_id
+      JOIN users u ON u.id = c.user_id
+      WHERE c.code_hash = ? AND c.challenge = ? AND c.expires_at > ? AND s.expires_at > ? AND u.frozen_at IS NULL`)
+      .bind(grantHash, codeHash, challenge, now, now),
+    c.env.DB.prepare('DELETE FROM flaxia_authorization_codes WHERE code_hash = ? AND challenge = ?').bind(codeHash, challenge),
+  ]);
+  if (result[0].meta.changes !== 1) return c.json({ error: 'Invalid authorization' }, 401);
+  const user = await c.env.DB.prepare('SELECT user_id FROM flaxia_session_grants WHERE token_hash = ?').bind(grantHash).first<{ user_id: string }>();
+  if (!user) return c.json({ error: 'Invalid authorization' }, 401);
+  const stamp = await credentialStamp(c.env.DB, user.user_id);
+  if (!stamp) return c.json({ error: 'Invalid authorization' }, 401);
+  const legacy = await c.env.DB.prepare('SELECT fingerprint FROM flaxia_legacy_fingerprints WHERE user_id = ?').bind(user.user_id).first<{ fingerprint: string }>();
+  return c.json({ user_id: user.user_id, grant, credential_stamp: stamp, legacy_stamp: legacy?.fingerprint ?? null });
+});
+
+bridge.post('/api/flaxia/introspect', bodyLimit({ maxSize: 512 }), async c => {
+  c.header('Cache-Control', 'no-store');
+  let body: { grant?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body.grant !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.grant)) return c.json({ error: 'Invalid request' }, 400);
+  const hash = await sha256url(body.grant);
+  const user = await c.env.DB.prepare(`SELECT g.user_id FROM flaxia_session_grants g
+    JOIN sessions s ON s.id = g.session_id AND s.user_id = g.user_id
+    JOIN users u ON u.id = g.user_id
+    WHERE g.token_hash = ? AND s.expires_at > ? AND u.frozen_at IS NULL`).bind(hash, new Date().toISOString()).first<{ user_id: string }>();
+  if (!user) return c.json({ error: 'Invalid authorization' }, 401);
+  const stamp = await credentialStamp(c.env.DB, user.user_id);
+  return stamp ? c.json({ user_id: user.user_id, credential_stamp: stamp }) : c.json({ error: 'Invalid authorization' }, 401);
+});
+
+bridge.post('/api/flaxia/reauth/start', bodyLimit({ maxSize: 512 }), async c => {
+  c.header('Cache-Control', 'no-store');
+  let body: { grant?: unknown; user_id?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  const user = await userForGrant(c.env.DB, body?.grant);
+  if (!user || user.id !== body?.user_id) return c.json({ error: 'Invalid authorization' }, 401);
+  if (await rateLimit(c.env.DB, `flaxia-reauth:user:${user.id}`, 10)) return c.json({ error: 'Too many requests' }, 429);
+  if (!user.srp_salt || !user.srp_verifier || !isSupportedSrpKdf(user.srp_kdf ?? 'sha256-v1')) return c.json({ error: 'SRP not available' }, 400);
+  const { B, b } = await serverStep1(dec(user.srp_salt), dec(user.srp_verifier));
+  const challenge = random();
+  await c.env.DB.prepare('DELETE FROM srp_handshakes WHERE expires_at <= ?').bind(new Date().toISOString()).run();
+  await c.env.DB.prepare('INSERT INTO srp_handshakes (id, user_id, b_scalar, b_pub, expires_at) VALUES (?, ?, ?, ?, ?)').bind(challenge, user.id, b.toString(), enc(B), expiry(300000)).run();
+  return c.json({ challenge_id: challenge, salt: user.srp_salt, B: enc(B), srp_kdf: user.srp_kdf ?? 'sha256-v1' });
+});
+
+bridge.post('/api/flaxia/reauth/verify', bodyLimit({ maxSize: 2048 }), async c => {
+  c.header('Cache-Control', 'no-store');
+  let body: { grant?: unknown; user_id?: unknown; challenge_id?: unknown; A?: unknown; M1?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  const user = await userForGrant(c.env.DB, body?.grant);
+  if (!user || user.id !== body?.user_id) return c.json({ error: 'Invalid authorization' }, 401);
+  return c.json({ valid: await verifyProof(c.env.DB, user, body) });
+});
+
+export class FlaxiaBridge extends WorkerEntrypoint<Env> {
+  async fetch(request: Request): Promise<Response> {
+    return bridge.fetch(request, this.env, this.ctx);
+  }
+}
 
 app.use('/api/auth/*', cors({ origin: origin => originAllowed(origin) ? origin : '', credentials: true, allowMethods: ['GET', 'POST', 'OPTIONS'], allowHeaders: ['Content-Type'] }));
 app.use('/api/auth/*', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'Request too large' }, 413) }));
@@ -105,13 +198,18 @@ app.post('/api/auth/login/legacy', async c => {
   if (user.frozen_at) return c.json({ error: 'account_frozen', username: user.username }, 403);
   const salt = generateSalt();
   const verifier = await computeVerifier(body.password, salt, 'pbkdf2-600k-v2');
-  const updated = await c.env.DB.prepare("UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = '2048', srp_kdf = 'pbkdf2-600k-v2', password_hash = '' WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL RETURNING id, username, display_name")
-    .bind(enc(salt), enc(verifier), user.id, user.password_hash).first<{ id: string; username: string; display_name: string }>();
-  if (!updated) return c.json({ error: 'Invalid credentials' }, 401);
+  const saltEncoded = enc(salt), verifierEncoded = enc(verifier);
+  const legacyStamp = await sha256url(JSON.stringify(['legacy', user.password_hash]));
   const token = random();
-  await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)').bind(token, updated.id, expiry(7 * 86400000)).run();
+  const result = await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = '2048', srp_kdf = 'pbkdf2-600k-v2', password_hash = '' WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL")
+      .bind(saltEncoded, verifierEncoded, user.id, user.password_hash),
+    c.env.DB.prepare('INSERT INTO flaxia_legacy_fingerprints (user_id, fingerprint) SELECT id, ? FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?').bind(legacyStamp, user.id, saltEncoded, verifierEncoded),
+    c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) SELECT ?, id, ? FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?').bind(token, expiry(7 * 86400000), user.id, saltEncoded, verifierEncoded),
+  ]);
+  if (result[0].meta.changes !== 1 || result[1].meta.changes !== 1 || result[2].meta.changes !== 1) return c.json({ error: 'Invalid credentials' }, 401);
   setCookie(c, cookieName, token, { ...cookieOptions, maxAge: 7 * 86400 });
-  return c.json({ user: updated });
+  return c.json({ user: { id: user.id, username: user.username, display_name: user.display_name } });
 });
 
 app.post('/api/auth/login/start', async c => {
@@ -160,6 +258,21 @@ app.get('/api/auth/me', async c => {
   return user ? c.json({ user }) : c.json({ error: 'Unauthenticated' }, 401);
 });
 
+app.post('/api/auth/flaxia/authorize', async c => {
+  if (c.req.header('Origin') !== 'https://flaxia.app') return c.json({ error: 'Invalid origin' }, 403);
+  const session = getCookie(c, cookieName);
+  const user = await sessionUser(c.env.DB, session);
+  if (!user || !session) return c.json({ error: 'Unauthenticated' }, 401);
+  if (await rateLimit(c.env.DB, `flaxia-authorize:user:${user.id}`, 10)) return c.json({ error: 'Too many requests' }, 429);
+  let body: { challenge?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body.challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.challenge)) return c.json({ error: 'Invalid request' }, 400);
+  const code = random();
+  await c.env.DB.prepare('DELETE FROM flaxia_authorization_codes WHERE expires_at <= ?').bind(new Date().toISOString()).run();
+  await c.env.DB.prepare('INSERT INTO flaxia_authorization_codes (code_hash, challenge, session_id, user_id, expires_at) VALUES (?, ?, ?, ?, ?)').bind(await sha256url(code), body.challenge, session, user.id, expiry(60000)).run();
+  return c.json({ code });
+});
+
 app.post('/api/auth/reauth/start', async c => {
   const user = await sessionUser(c.env.DB, getCookie(c, cookieName));
   if (!user) return c.json({ error: 'Unauthenticated' }, 401);
@@ -190,8 +303,11 @@ app.post('/api/auth/upgrade-srp', async c => {
   if (typeof salt !== 'string' || salt.length > 32 || typeof verifier !== 'string' || verifier.length > 400 || group !== '2048' || !isCreatableSrpKdf(kdf)) return c.json({ error: 'Invalid SRP parameters' }, 400);
   if (!validCredentials(salt, verifier)) return c.json({ error: 'Invalid SRP parameters' }, 400);
   if (!await verifyProof(c.env.DB, user, body.current_srp)) return c.json({ error: 'Current password is incorrect' }, 401);
-  const updated = await c.env.DB.prepare('UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ? WHERE id = ? AND srp_verifier = ? AND srp_salt = ?').bind(salt, verifier, group, kdf, '', user.id, user.srp_verifier, user.srp_salt).run();
-  if (!updated.meta.changes) return c.json({ error: 'Credentials changed' }, 409);
+  const updated = await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ? WHERE id = ? AND srp_verifier = ? AND srp_salt = ?').bind(salt, verifier, group, kdf, '', user.id, user.srp_verifier, user.srp_salt),
+    c.env.DB.prepare('DELETE FROM flaxia_legacy_fingerprints WHERE user_id = ? AND EXISTS (SELECT 1 FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?)').bind(user.id, user.id, salt, verifier),
+  ]);
+  if (!updated[0].meta.changes) return c.json({ error: 'Credentials changed' }, 409);
   return c.json({ success: true });
 });
 app.post('/api/auth/logout', async c => {

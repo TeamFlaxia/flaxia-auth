@@ -8,7 +8,7 @@ import {
   serverStep1,
   serverStep2,
   verifyServerProof,
-} from '../src/srp.ts';
+} from '../src/lib/srp.ts';
 
 async function runHandshake(password: string, wrongPassword?: string) {
   const salt = generateSalt();

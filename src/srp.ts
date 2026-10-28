@@ -25,6 +25,11 @@ const N = BigInt(
 );
 const G = 2n;
 const N_BYTES = 256;
+export function isValidVerifier(verifier: Uint8Array): boolean {
+  if (verifier.length !== N_BYTES) return false;
+  const value = bytesToBigInt(verifier);
+  return value > 0n && value < N;
+}
 // k = H(PAD(N) | PAD(g)) with SHA-256 (precomputed).
 const K_MULT = BigInt('0x5b9e8ef059c6b32ea59fc1d322d37f04aa30bae5aa9003b8321e21ddb04e300');
 const subtle = crypto.subtle;

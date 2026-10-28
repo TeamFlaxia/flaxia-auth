@@ -20,7 +20,7 @@ import {
   serverStep1,
   serverStep2,
   verifyServerProof,
-} from '../src/srp.ts';
+} from '../src/lib/srp.ts';
 
 async function handshake(password: string, kdf: Parameters<typeof computeVerifier>[2]) {
   const salt = generateSalt();

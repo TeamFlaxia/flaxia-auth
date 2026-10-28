@@ -51,11 +51,11 @@ async function sessionUser(db: D1Database, token: string | undefined): Promise<U
   return db.prepare('SELECT u.* FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.id = ? AND s.expires_at > ? AND u.frozen_at IS NULL').bind(token, new Date().toISOString()).first<User>();
 }
 
-async function verifyProof(db: D1Database, user: User, input: unknown): Promise<boolean> {
+async function verifyProof(db: D1Database, user: User, input: unknown, purpose: 'session-reauth' | 'grant-reauth', binding: string): Promise<boolean> {
   if (!input || typeof input !== 'object') return false;
   const proof = input as SrpProof;
   if (typeof proof.challenge_id !== 'string' || proof.challenge_id.length > 64 || typeof proof.A !== 'string' || proof.A.length > 400 || typeof proof.M1 !== 'string' || proof.M1.length > 64 || !user.srp_verifier) return false;
-  const hs = await db.prepare('DELETE FROM srp_handshakes WHERE id = ? AND user_id = ? AND expires_at > ? RETURNING user_id, b_scalar, b_pub').bind(proof.challenge_id, user.id, new Date().toISOString()).first<Handshake>();
+  const hs = await db.prepare('DELETE FROM srp_handshakes WHERE id = ? AND user_id = ? AND purpose = ? AND binding_hash = ? AND expires_at > ? RETURNING user_id, b_scalar, b_pub').bind(proof.challenge_id, user.id, purpose, await sha256url(binding), new Date().toISOString()).first<Handshake>();
   if (!hs) return false;
   try {
     const A = dec(proof.A), M1 = dec(proof.M1);
@@ -135,7 +135,7 @@ bridge.post('/api/flaxia/reauth/start', bodyLimit({ maxSize: 512 }), async c => 
   const { B, b } = await serverStep1(dec(user.srp_salt), dec(user.srp_verifier));
   const challenge = random();
   await c.env.DB.prepare('DELETE FROM srp_handshakes WHERE expires_at <= ?').bind(new Date().toISOString()).run();
-  await c.env.DB.prepare('INSERT INTO srp_handshakes (id, user_id, b_scalar, b_pub, expires_at) VALUES (?, ?, ?, ?, ?)').bind(challenge, user.id, b.toString(), enc(B), expiry(300000)).run();
+  await c.env.DB.prepare('INSERT INTO srp_handshakes (id, user_id, b_scalar, b_pub, expires_at, purpose, binding_hash) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(challenge, user.id, b.toString(), enc(B), expiry(300000), 'grant-reauth', await sha256url(body.grant as string)).run();
   return c.json({ challenge_id: challenge, salt: user.srp_salt, B: enc(B), srp_kdf: user.srp_kdf ?? 'sha256-v1' });
 });
 
@@ -145,7 +145,7 @@ bridge.post('/api/flaxia/reauth/verify', bodyLimit({ maxSize: 2048 }), async c =
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
   const user = await userForGrant(c.env.DB, body?.grant);
   if (!user || user.id !== body?.user_id) return c.json({ error: 'Invalid authorization' }, 401);
-  return c.json({ valid: await verifyProof(c.env.DB, user, body) });
+  return c.json({ valid: await verifyProof(c.env.DB, user, body, 'grant-reauth', body.grant as string) });
 });
 
 export class FlaxiaBridge extends WorkerEntrypoint<Env> {
@@ -234,7 +234,7 @@ app.post('/api/auth/login/verify', async c => {
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'Invalid request' }, 400);
   if (typeof body.challenge_id !== 'string' || body.challenge_id.length > 64 || typeof body.A !== 'string' || body.A.length > 400 || typeof body.M1 !== 'string' || body.M1.length > 64) return c.json({ error: 'Invalid request' }, 400);
-  const hs = await c.env.DB.prepare('DELETE FROM srp_handshakes WHERE id = ? AND expires_at > ? RETURNING user_id, b_scalar, b_pub').bind(body.challenge_id, new Date().toISOString()).first<{ user_id: string; b_scalar: string; b_pub: string }>();
+  const hs = await c.env.DB.prepare("DELETE FROM srp_handshakes WHERE id = ? AND purpose = 'login' AND expires_at > ? RETURNING user_id, b_scalar, b_pub").bind(body.challenge_id, new Date().toISOString()).first<{ user_id: string; b_scalar: string; b_pub: string }>();
   if (!hs) return c.json({ error: 'Invalid credentials' }, 401);
   const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(hs.user_id).first<User>();
   if (!user?.srp_verifier) return c.json({ error: 'Invalid credentials' }, 401);
@@ -277,35 +277,38 @@ app.post('/api/auth/flaxia/authorize', async c => {
 });
 
 app.post('/api/auth/reauth/start', async c => {
-  const user = await sessionUser(c.env.DB, getCookie(c, cookieName));
-  if (!user) return c.json({ error: 'Unauthenticated' }, 401);
+  const session = getCookie(c, cookieName);
+  const user = await sessionUser(c.env.DB, session);
+  if (!user || !session) return c.json({ error: 'Unauthenticated' }, 401);
   if (await rateLimit(c.env.DB, `reauth-start:user:${user.id}`, 10)) return c.json({ error: 'Too many requests' }, 429);
   if (!user.srp_salt || !user.srp_verifier || !isSupportedSrpKdf(user.srp_kdf ?? 'sha256-v1')) return c.json({ error: 'SRP not available' }, 400);
   const { B, b } = await serverStep1(dec(user.srp_salt), dec(user.srp_verifier));
   const challenge = random();
   await c.env.DB.prepare('DELETE FROM srp_handshakes WHERE expires_at <= ?').bind(new Date().toISOString()).run();
-  await c.env.DB.prepare('INSERT INTO srp_handshakes (id, user_id, b_scalar, b_pub, expires_at) VALUES (?, ?, ?, ?, ?)').bind(challenge, user.id, b.toString(), enc(B), expiry(300000)).run();
+  await c.env.DB.prepare('INSERT INTO srp_handshakes (id, user_id, b_scalar, b_pub, expires_at, purpose, binding_hash) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(challenge, user.id, b.toString(), enc(B), expiry(300000), 'session-reauth', await sha256url(session)).run();
   return c.json({ challenge_id: challenge, salt: user.srp_salt, B: enc(B), srp_kdf: user.srp_kdf ?? 'sha256-v1' });
 });
 
 app.post('/api/auth/reauth/verify', async c => {
-  const user = await sessionUser(c.env.DB, getCookie(c, cookieName));
-  if (!user) return c.json({ error: 'Unauthenticated' }, 401);
+  const session = getCookie(c, cookieName);
+  const user = await sessionUser(c.env.DB, session);
+  if (!user || !session) return c.json({ error: 'Unauthenticated' }, 401);
   let body: unknown;
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
-  return c.json({ valid: await verifyProof(c.env.DB, user, body) });
+  return c.json({ valid: await verifyProof(c.env.DB, user, body, 'session-reauth', session) });
 });
 
 app.post('/api/auth/upgrade-srp', async c => {
-  const user = await sessionUser(c.env.DB, getCookie(c, cookieName));
-  if (!user) return c.json({ error: 'Unauthenticated' }, 401);
+  const session = getCookie(c, cookieName);
+  const user = await sessionUser(c.env.DB, session);
+  if (!user || !session) return c.json({ error: 'Unauthenticated' }, 401);
   let body: Record<string, unknown>;
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
   if (!body || typeof body !== 'object' || Array.isArray(body) || !body.current_srp) return c.json({ error: 'Current password proof is required' }, 400);
   const { srp_salt: salt, srp_verifier: verifier, srp_group: group, srp_kdf: kdf } = body;
   if (typeof salt !== 'string' || salt.length > 32 || typeof verifier !== 'string' || verifier.length > 400 || group !== '2048' || !isCreatableSrpKdf(kdf)) return c.json({ error: 'Invalid SRP parameters' }, 400);
   if (!validCredentials(salt, verifier)) return c.json({ error: 'Invalid SRP parameters' }, 400);
-  if (!await verifyProof(c.env.DB, user, body.current_srp)) return c.json({ error: 'Current password is incorrect' }, 401);
+  if (!await verifyProof(c.env.DB, user, body.current_srp, 'session-reauth', session)) return c.json({ error: 'Current password is incorrect' }, 401);
   const updated = await c.env.DB.batch([
     c.env.DB.prepare('UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ? WHERE id = ? AND srp_verifier = ? AND srp_salt = ?').bind(salt, verifier, group, kdf, '', user.id, user.srp_verifier, user.srp_salt),
     c.env.DB.prepare('DELETE FROM flaxia_legacy_fingerprints WHERE user_id = ? AND EXISTS (SELECT 1 FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?)').bind(user.id, user.id, salt, verifier),
@@ -321,3 +324,4 @@ app.post('/api/auth/logout', async c => {
 });
 
 export default app;
+

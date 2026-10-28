@@ -120,6 +120,7 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal(me.status, 200);
   assert.equal((await me.json()).user.id, result.user.id);
   const session = cookie.split(';')[0];
+  const registrationSession = registered.headers.get('set-cookie').split(';')[0];
   assert.equal((await request('/api/auth/reauth/start')).status, 401);
   async function reauthProof() {
     const response = await request('/api/auth/reauth/start', { cookie: session });
@@ -129,6 +130,16 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
     const finish = await clientStep2(password, decode(challenge.salt), first.a, decode(challenge.B), challenge.srp_kdf);
     return { challenge_id: challenge.challenge_id, A: encode(finish.A), M1: encode(finish.M1) };
   }
+  const otherSessionProof = await reauthProof();
+  assert.equal((await request('/api/auth/login/verify', { body: otherSessionProof, ip: '192.0.2.71' })).status, 401);
+  assert.equal((await (await request('/api/auth/reauth/verify', { cookie: registrationSession, body: otherSessionProof })).json()).valid, false);
+  assert.equal((await (await request('/api/auth/reauth/verify', { cookie: session, body: otherSessionProof })).json()).valid, true);
+  const loginChallenge = await (await request('/api/auth/login/start', { body: { username: 'testuser' }, ip: '192.0.2.70' })).json();
+  const loginFirst = await clientStep1(password, decode(loginChallenge.salt));
+  const loginProof = await clientStep2(password, decode(loginChallenge.salt), loginFirst.a, decode(loginChallenge.B), loginChallenge.srp_kdf);
+  const loginBody = { challenge_id: loginChallenge.challenge_id, A: encode(loginProof.A), M1: encode(loginProof.M1) };
+  assert.equal((await (await request('/api/auth/reauth/verify', { cookie: session, body: loginBody })).json()).valid, false);
+  assert.equal((await request('/api/auth/login/verify', { body: loginBody, ip: '192.0.2.70' })).status, 200);
   const reauth = await reauthProof();
   assert.equal((await (await request('/api/auth/reauth/verify', { cookie: session, body: reauth })).json()).valid, true);
   assert.equal((await (await request('/api/auth/reauth/verify', { cookie: session, body: reauth })).json()).valid, false);
@@ -216,6 +227,16 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   const bridgeFirst = await clientStep1(legacyPassword, decode(reauthChallenge.salt));
   const bridgeProof = await clientStep2(legacyPassword, decode(reauthChallenge.salt), bridgeFirst.a, decode(reauthChallenge.B), reauthChallenge.srp_kdf);
   const bridgeBody = { grant: grant.grant, user_id: grant.user_id, challenge_id: reauthChallenge.challenge_id, A: encode(bridgeProof.A), M1: encode(bridgeProof.M1) };
+  const secondVerifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
+  const secondChallenge = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secondVerifier))).toString('base64url');
+  const secondAuthorization = await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: secondChallenge }, ip: '192.0.2.13' });
+  assert.equal(secondAuthorization.status, 200);
+  const secondCode = (await secondAuthorization.json()).code;
+  const secondGrantResponse = await bridgePost('/api/flaxia/exchange', { code: secondCode, verifier: secondVerifier });
+  assert.equal(secondGrantResponse.status, 200);
+  const secondGrant = await secondGrantResponse.json();
+  assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', { ...bridgeBody, grant: secondGrant.grant })).json()).valid, false);
+  assert.equal((await (await request('/api/auth/reauth/verify', { cookie: authCookie, body: bridgeBody, ip: '192.0.2.13' })).json()).valid, false);
   assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', bridgeBody)).json()).valid, true);
   assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', bridgeBody)).json()).valid, false);
   assert.equal((await request('/api/auth/logout', { cookie: authCookie, ip: '192.0.2.13' })).status, 200);
@@ -227,3 +248,4 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   for (let i = 0; i < 20; i++) assert.notEqual((await request('/api/auth/login/start', { body: { username: 'missing' }, ip: '192.0.2.9' })).status, 429);
   assert.equal((await request('/api/auth/login/start', { body: { username: 'missing' }, ip: '192.0.2.9' })).status, 429);
 });
+

@@ -81,6 +81,28 @@ async function userForGrant(db: D1Database, grant: unknown): Promise<User | null
 // A one-time code is bound to a client-generated verifier, so intercepting it
 // alone cannot create a Flaxia session.
 bridge.get('/health', c => c.json({ status: 'ok' }));
+// The caller is the trusted Flaxia service binding. Repeating a request is
+// safe after a timeout; a conflicting identity is never modified or linked.
+bridge.post('/api/flaxia/provision', bodyLimit({ maxSize: 2048 }), async c => {
+  c.header('Cache-Control', 'no-store');
+  let body: Record<string, unknown>;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'Invalid request' }, 400);
+  const { user_id: id, username, display_name: display, srp_salt: salt, srp_verifier: verifier, srp_group: group, srp_kdf: kdf } = body;
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(id) ||
+      typeof username !== 'string' || !/^[A-Za-z0-9_]{1,20}$/.test(username) ||
+      typeof display !== 'string' || display.length < 1 || display.length > 50 ||
+      typeof salt !== 'string' || typeof verifier !== 'string' || salt.length > 32 || verifier.length > 400 ||
+      group !== '2048' || !isCreatableSrpKdf(kdf) || !validCredentials(salt, verifier)) return c.json({ error: 'Invalid request' }, 400);
+  await c.env.DB.batch([
+    c.env.DB.prepare('INSERT OR IGNORE INTO users (id, username, display_name, srp_salt, srp_verifier, srp_group, srp_kdf) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(id, username, display, salt, verifier, group, kdf),
+    c.env.DB.prepare(`INSERT OR IGNORE INTO flaxia_credential_guards (user_id)
+      SELECT id FROM users WHERE id = ? AND username = ? COLLATE BINARY AND display_name = ? AND srp_salt = ? AND srp_verifier = ? AND srp_group = ? AND srp_kdf = ? AND frozen_at IS NULL`).bind(id, username, display, salt, verifier, group, kdf),
+  ]);
+  const matches = await c.env.DB.prepare(`SELECT 1 AS ok FROM users u JOIN flaxia_credential_guards g ON g.user_id = u.id
+    WHERE u.id = ? AND u.username = ? COLLATE BINARY AND u.display_name = ? AND u.srp_salt = ? AND u.srp_verifier = ? AND u.srp_group = ? AND u.srp_kdf = ? AND u.frozen_at IS NULL`).bind(id, username, display, salt, verifier, group, kdf).first();
+  return matches ? c.json({ success: true }) : c.json({ error: 'Identity conflict' }, 409);
+});
 bridge.post('/api/flaxia/exchange', bodyLimit({ maxSize: 1024 }), async c => {
   c.header('Cache-Control', 'no-store');
   let body: { code?: unknown; verifier?: unknown };

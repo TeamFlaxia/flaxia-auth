@@ -220,6 +220,12 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal(activeGrant.status, 200);
   assert.equal((await activeGrant.json()).credential_stamp, grant.credential_stamp);
   const bridgePost = (path, body) => fetch(`${bridgeBase}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const provision = { user_id: 'provision-id', username: 'ProvisionUser', display_name: 'Provision User', srp_salt: encode(salt), srp_verifier: encode(verifier), srp_group: '2048', srp_kdf: 'pbkdf2-600k-v2' };
+  assert.equal((await bridgePost('/api/flaxia/provision', provision)).status, 200);
+  assert.equal((await bridgePost('/api/flaxia/provision', provision)).status, 200);
+  assert.equal((await bridgePost('/api/flaxia/provision', { ...provision, username: 'DifferentUser' })).status, 409);
+  assert.equal((await bridgePost('/api/flaxia/provision', { ...provision, user_id: 'different-id' })).status, 409);
+  assert.equal((await request('/api/flaxia/provision', { body: provision })).status, 404);
   assert.equal((await bridgePost('/api/flaxia/reauth/start', { grant: grant.grant, user_id: 'wrong-user' })).status, 401);
   const bridgeReauth = await bridgePost('/api/flaxia/reauth/start', { grant: grant.grant, user_id: grant.user_id });
   assert.equal(bridgeReauth.status, 200);

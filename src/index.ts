@@ -96,7 +96,8 @@ bridge.post('/api/flaxia/exchange', bodyLimit({ maxSize: 1024 }), async c => {
       SELECT ?, c.session_id, c.user_id FROM flaxia_authorization_codes c
       JOIN sessions s ON s.id = c.session_id AND s.user_id = c.user_id
       JOIN users u ON u.id = c.user_id
-      WHERE c.code_hash = ? AND c.challenge = ? AND c.expires_at > ? AND s.expires_at > ? AND u.frozen_at IS NULL`)
+      WHERE c.code_hash = ? AND c.challenge = ? AND c.expires_at > ? AND s.expires_at > ? AND u.frozen_at IS NULL
+        AND COALESCE(u.srp_salt, '') <> '' AND COALESCE(u.srp_verifier, '') <> '' AND COALESCE(u.srp_group, '') <> ''`)
       .bind(grantHash, codeHash, challenge, now, now),
     c.env.DB.prepare('DELETE FROM flaxia_authorization_codes WHERE code_hash = ? AND challenge = ?').bind(codeHash, challenge),
   ]);
@@ -104,7 +105,10 @@ bridge.post('/api/flaxia/exchange', bodyLimit({ maxSize: 1024 }), async c => {
   const user = await c.env.DB.prepare('SELECT user_id FROM flaxia_session_grants WHERE token_hash = ?').bind(grantHash).first<{ user_id: string }>();
   if (!user) return c.json({ error: 'Invalid authorization' }, 401);
   const stamp = await credentialStamp(c.env.DB, user.user_id);
-  if (!stamp) return c.json({ error: 'Invalid authorization' }, 401);
+  if (!stamp) {
+    await c.env.DB.prepare('DELETE FROM flaxia_session_grants WHERE token_hash = ?').bind(grantHash).run();
+    return c.json({ error: 'Invalid authorization' }, 401);
+  }
   const legacy = await c.env.DB.prepare('SELECT fingerprint FROM flaxia_legacy_fingerprints WHERE user_id = ?').bind(user.user_id).first<{ fingerprint: string }>();
   return c.json({ user_id: user.user_id, grant, credential_stamp: stamp, legacy_stamp: legacy?.fingerprint ?? null });
 });
@@ -213,9 +217,9 @@ app.post('/api/auth/login/legacy', async c => {
   const legacyStamp = await sha256url(JSON.stringify(['legacy', user.password_hash]));
   const token = random();
   const result = await c.env.DB.batch([
+    c.env.DB.prepare('INSERT INTO flaxia_legacy_fingerprints (user_id, fingerprint) SELECT id, ? FROM users WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL').bind(legacyStamp, user.id, user.password_hash),
     c.env.DB.prepare("UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = '2048', srp_kdf = 'pbkdf2-600k-v2', password_hash = '' WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL")
       .bind(saltEncoded, verifierEncoded, user.id, user.password_hash),
-    c.env.DB.prepare('INSERT INTO flaxia_legacy_fingerprints (user_id, fingerprint) SELECT id, ? FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?').bind(legacyStamp, user.id, saltEncoded, verifierEncoded),
     c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) SELECT ?, id, ? FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?').bind(token, expiry(7 * 86400000), user.id, saltEncoded, verifierEncoded),
   ]);
   if (result[0].meta.changes !== 1 || result[1].meta.changes !== 1 || result[2].meta.changes !== 1) return c.json({ error: 'Invalid credentials' }, 401);
@@ -334,5 +338,14 @@ app.post('/api/auth/logout', async c => {
   return c.json({ success: true });
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    const now = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM flaxia_authorization_codes WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM sessions WHERE expires_at <= ?').bind(now),
+    ]);
+  },
+};
 

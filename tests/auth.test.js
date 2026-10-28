@@ -243,6 +243,21 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal((await bridgePost('/api/flaxia/revoke', { grant: secondGrant.grant })).status, 200);
   assert.equal((await bridgePost('/api/flaxia/introspect', { grant: secondGrant.grant })).status, 401);
   assert.equal((await introspect()).status, 200);
+  const invalidVerifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
+  const invalidChallenge = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(invalidVerifier))).toString('base64url');
+  const invalidAuthorization = await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: invalidChallenge }, ip: '192.0.2.13' });
+  assert.equal(invalidAuthorization.status, 200);
+  const invalidCode = (await invalidAuthorization.json()).code;
+  const query = sql => {
+    const result = spawnSync(process.execPath, [wrangler, 'd1', 'execute', 'flaxia-auth-prod', '--local', '--persist-to', directory, '--command', sql, '--json'], { encoding: 'utf8', env: { ...process.env, CI: 'true' } });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout)[0].results;
+  };
+  const grantCount = query('SELECT count(*) AS count FROM flaxia_session_grants')[0].count;
+  query("UPDATE users SET srp_group = '' WHERE id = 'needs-upgrade'");
+  assert.equal((await bridgePost('/api/flaxia/exchange', { code: invalidCode, verifier: invalidVerifier })).status, 401);
+  assert.equal(query('SELECT count(*) AS count FROM flaxia_session_grants')[0].count, grantCount);
+  query("UPDATE users SET srp_group = '2048' WHERE id = 'needs-upgrade'");
   assert.equal((await request('/api/auth/logout', { cookie: authCookie, ip: '192.0.2.13' })).status, 200);
   assert.equal((await introspect()).status, 401);
   const races = await Promise.all([1, 2].map(i => request(legacyEndpoint, { body: { username: 'RaceUser', password: legacyPassword }, ip: `192.0.2.${40 + i}` })));

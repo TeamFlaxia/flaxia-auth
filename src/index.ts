@@ -269,6 +269,9 @@ app.post('/api/auth/flaxia/authorize', async c => {
   if (!body || typeof body.challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.challenge)) return c.json({ error: 'Invalid request' }, 400);
   const code = random();
   await c.env.DB.prepare('DELETE FROM flaxia_authorization_codes WHERE expires_at <= ?').bind(new Date().toISOString()).run();
+  await c.env.DB.prepare(`DELETE FROM flaxia_session_grants WHERE token_hash IN (
+    SELECT g.token_hash FROM flaxia_session_grants g JOIN sessions s ON s.id = g.session_id WHERE s.expires_at <= ? LIMIT 100
+  )`).bind(new Date().toISOString()).run();
   await c.env.DB.prepare('INSERT INTO flaxia_authorization_codes (code_hash, challenge, session_id, user_id, expires_at) VALUES (?, ?, ?, ?, ?)').bind(await sha256url(code), body.challenge, session, user.id, expiry(60000)).run();
   return c.json({ code });
 });

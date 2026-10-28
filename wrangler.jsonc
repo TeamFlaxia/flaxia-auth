@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "flaxia-auth",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-28",
+  "routes": [
+    {
+      "pattern": "id.flaxia.app",
+      "custom_domain": true
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "flaxia-auth-prod",
+      "database_id": "9ad903d0-dd62-4b88-bc98-d078d2176e61",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "flaxia-auth",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "npm@10.9.9",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "typecheck": "wrangler types --check && tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.13.14"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.154.0"
+  }
+}

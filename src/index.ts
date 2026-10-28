@@ -124,6 +124,17 @@ bridge.post('/api/flaxia/introspect', bodyLimit({ maxSize: 512 }), async c => {
   return stamp ? c.json({ user_id: user.user_id, credential_stamp: stamp }) : c.json({ error: 'Invalid authorization' }, 401);
 });
 
+// Revokes only this application's grant; other grants and the Auth session
+// remain available. Deleting an already-revoked grant is idempotent.
+bridge.post('/api/flaxia/revoke', bodyLimit({ maxSize: 512 }), async c => {
+  c.header('Cache-Control', 'no-store');
+  let body: { grant?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body.grant !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.grant)) return c.json({ error: 'Invalid request' }, 400);
+  await c.env.DB.prepare('DELETE FROM flaxia_session_grants WHERE token_hash = ?').bind(await sha256url(body.grant)).run();
+  return c.json({ success: true });
+});
+
 bridge.post('/api/flaxia/reauth/start', bodyLimit({ maxSize: 512 }), async c => {
   c.header('Cache-Control', 'no-store');
   let body: { grant?: unknown; user_id?: unknown };

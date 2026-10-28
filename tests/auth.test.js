@@ -239,6 +239,10 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal((await (await request('/api/auth/reauth/verify', { cookie: authCookie, body: bridgeBody, ip: '192.0.2.13' })).json()).valid, false);
   assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', bridgeBody)).json()).valid, true);
   assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', bridgeBody)).json()).valid, false);
+  assert.equal((await bridgePost('/api/flaxia/revoke', { grant: secondGrant.grant })).status, 200);
+  assert.equal((await bridgePost('/api/flaxia/revoke', { grant: secondGrant.grant })).status, 200);
+  assert.equal((await bridgePost('/api/flaxia/introspect', { grant: secondGrant.grant })).status, 401);
+  assert.equal((await introspect()).status, 200);
   assert.equal((await request('/api/auth/logout', { cookie: authCookie, ip: '192.0.2.13' })).status, 200);
   assert.equal((await introspect()).status, 401);
   const races = await Promise.all([1, 2].map(i => request(legacyEndpoint, { body: { username: 'RaceUser', password: legacyPassword }, ip: `192.0.2.${40 + i}` })));

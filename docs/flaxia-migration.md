@@ -7,3 +7,16 @@ The guard cannot recover hashes already removed before migration 0004. Before en
 Legacy fingerprints are sensitive password-derived data. They are removed on credential change or account deletion. Migration 0006 sets a 90-day expiry from creation (existing rows receive 90 days from migration). The exchange rejects expired fingerprints even before the hourly cleanup deletes them. After expiry, affected users need a separately verified recovery process. Monitor expiry and complete account migration before the deadline. Restrict database and backup access and cover backups in the retention decision.
 
 An hourly Worker cron deletes expired authorization codes and Auth sessions; grants attached to deleted sessions are removed by foreign-key cascade. Monitor cron failures and database growth. A failed cron delays physical cleanup but does not extend authorization validity.
+
+## Restore and removal procedure
+
+The live database retains each fingerprint for at most 90 days from its creation; existing rows receive a 90-day window when migration 0006 is applied. Hourly cleanup removes expired rows, and exchanges refuse them immediately at expiry. Restrict backups containing these rows to the same administrators as the live Auth database and expire each backup no later than 90 days after the backup is taken. Record and verify the storage provider's backup deletion configuration; the application cannot erase provider-managed backups.
+
+Before a restored database is connected to any Worker, apply all migrations and run this on the isolated restored database:
+
+```sql
+DELETE FROM flaxia_legacy_fingerprints
+WHERE expires_at IS NULL OR expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+```
+
+Then confirm `SELECT count(*) FROM flaxia_legacy_fingerprints WHERE expires_at IS NULL OR expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')` returns zero. Run the same deletion on the live database for an emergency purge, followed by the count check. For early removal of all fingerprints after the transition is complete, use `DELETE FROM flaxia_legacy_fingerprints` and confirm the table is empty; this immediately disables legacy account matching. Do not perform this early purge until affected users have a verified recovery path. Record the purge and make sure no old Worker remains active before reopening the service.

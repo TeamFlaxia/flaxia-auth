@@ -235,6 +235,16 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   const secondGrantResponse = await bridgePost('/api/flaxia/exchange', { code: secondCode, verifier: secondVerifier });
   assert.equal(secondGrantResponse.status, 200);
   const secondGrant = await secondGrantResponse.json();
+  const expireFingerprint = spawnSync(process.execPath, [wrangler, 'd1', 'execute', 'flaxia-auth-prod', '--local', '--persist-to', directory, '--command', "UPDATE flaxia_legacy_fingerprints SET expires_at = '2000-01-01T00:00:00.000Z' WHERE user_id = 'needs-upgrade'"], { encoding: 'utf8', env: { ...process.env, CI: 'true' } });
+  assert.equal(expireFingerprint.status, 0, expireFingerprint.stderr);
+  const expiredVerifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
+  const expiredChallenge = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(expiredVerifier))).toString('base64url');
+  const expiredAuthorization = await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: expiredChallenge }, ip: '192.0.2.13' });
+  assert.equal(expiredAuthorization.status, 200);
+  const expiredCode = (await expiredAuthorization.json()).code;
+  const expiredExchange = await bridgePost('/api/flaxia/exchange', { code: expiredCode, verifier: expiredVerifier });
+  assert.equal(expiredExchange.status, 200);
+  assert.equal((await expiredExchange.json()).legacy_stamp, null);
   assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', { ...bridgeBody, grant: secondGrant.grant })).json()).valid, false);
   assert.equal((await (await request('/api/auth/reauth/verify', { cookie: authCookie, body: bridgeBody, ip: '192.0.2.13' })).json()).valid, false);
   assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', bridgeBody)).json()).valid, true);

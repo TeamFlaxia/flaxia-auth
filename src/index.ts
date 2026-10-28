@@ -109,7 +109,7 @@ bridge.post('/api/flaxia/exchange', bodyLimit({ maxSize: 1024 }), async c => {
     await c.env.DB.prepare('DELETE FROM flaxia_session_grants WHERE token_hash = ?').bind(grantHash).run();
     return c.json({ error: 'Invalid authorization' }, 401);
   }
-  const legacy = await c.env.DB.prepare('SELECT fingerprint FROM flaxia_legacy_fingerprints WHERE user_id = ?').bind(user.user_id).first<{ fingerprint: string }>();
+  const legacy = await c.env.DB.prepare('SELECT fingerprint FROM flaxia_legacy_fingerprints WHERE user_id = ? AND expires_at > ?').bind(user.user_id, new Date().toISOString()).first<{ fingerprint: string }>();
   return c.json({ user_id: user.user_id, grant, credential_stamp: stamp, legacy_stamp: legacy?.fingerprint ?? null });
 });
 
@@ -217,7 +217,7 @@ app.post('/api/auth/login/legacy', async c => {
   const legacyStamp = await sha256url(JSON.stringify(['legacy', user.password_hash]));
   const token = random();
   const result = await c.env.DB.batch([
-    c.env.DB.prepare('INSERT INTO flaxia_legacy_fingerprints (user_id, fingerprint) SELECT id, ? FROM users WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL').bind(legacyStamp, user.id, user.password_hash),
+    c.env.DB.prepare('INSERT INTO flaxia_legacy_fingerprints (user_id, fingerprint, expires_at) SELECT id, ?, ? FROM users WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL').bind(legacyStamp, expiry(90 * 86400000), user.id, user.password_hash),
     c.env.DB.prepare("UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = '2048', srp_kdf = 'pbkdf2-600k-v2', password_hash = '' WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL")
       .bind(saltEncoded, verifierEncoded, user.id, user.password_hash),
     c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) SELECT ?, id, ? FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?').bind(token, expiry(7 * 86400000), user.id, saltEncoded, verifierEncoded),
@@ -344,6 +344,7 @@ export default {
     const now = new Date().toISOString();
     await env.DB.batch([
       env.DB.prepare('DELETE FROM flaxia_authorization_codes WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM flaxia_legacy_fingerprints WHERE expires_at <= ?').bind(now),
       env.DB.prepare('DELETE FROM sessions WHERE expires_at <= ?').bind(now),
     ]);
   },

@@ -5,7 +5,7 @@
   "compatibility_date": "2026-10-28",
   "routes": [
     {
-      "pattern": "id.flaxia.app",
+      "pattern": "auth.flaxia.app",
       "custom_domain": true
     }
   ],

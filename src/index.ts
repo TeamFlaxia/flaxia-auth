@@ -3,6 +3,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { cors } from 'hono/cors';
 import { bodyLimit } from 'hono/body-limit';
 import { isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, serverStep2 } from './srp';
+import { originAllowed } from './origin';
 
 const app = new Hono<{ Bindings: Env }>();
 const enc = (data: Uint8Array) => btoa(String.fromCharCode(...data));
@@ -17,7 +18,6 @@ const random = () => enc(crypto.getRandomValues(new Uint8Array(32))).replaceAll(
 const expiry = (ms: number) => new Date(Date.now() + ms).toISOString();
 const cookieName = '__Host-flaxia_session';
 const cookieOptions = { httpOnly: true, secure: true, sameSite: 'Lax' as const, path: '/' };
-const originAllowed = (origin: string | undefined) => origin === 'https://id.flaxia.app' || origin === 'https://flaxia.app';
 
 type User = { id: string; username: string; display_name: string; srp_salt: string | null; srp_verifier: string | null; srp_kdf: string | null; frozen_at: string | null };
 type Handshake = { user_id: string; b_scalar: string; b_pub: string };

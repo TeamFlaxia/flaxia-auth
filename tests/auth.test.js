@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { generateSalt, computeVerifier, clientStep1, clientStep2, verifyServerProof } from '../src/srp.ts';
+import { originAllowed } from '../src/origin.ts';
 
 const wrangler = join(process.cwd(), 'node_modules', 'wrangler', 'bin', 'wrangler.js');
 const encode = bytes => Buffer.from(bytes).toString('base64');
@@ -52,6 +53,8 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal(preflight.status, 204);
   assert.equal(preflight.headers.get('access-control-allow-origin'), 'https://flaxia.app');
   assert.equal(preflight.headers.get('access-control-allow-credentials'), 'true');
+  assert.equal(originAllowed('https://auth.flaxia.app'), true);
+  assert.equal(originAllowed('https://id.flaxia.app'), false);
   const deniedPreflight = await fetch(`${base}/api/auth/register`, { method: 'OPTIONS', headers: { Origin: 'https://evil.example', 'Access-Control-Request-Method': 'POST' } });
   assert.notEqual(deniedPreflight.headers.get('access-control-allow-origin'), 'https://evil.example');
   const password = 'a strong test password';

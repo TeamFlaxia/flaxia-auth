@@ -1,10 +1,10 @@
 # 認証 API
 
-Base URL: `https://id.flaxia.app`
+Base URL: `https://auth.flaxia.app`
 
 この文書はリポジトリの実装を記載しています。未デプロイの変更がある場合、本番のAPIとは異なります。
 
-ブラウザからのリクエストは `credentials: 'include'` を指定します。許可するOriginは `https://id.flaxia.app` と `https://flaxia.app` です。POSTには許可された `Origin` が必要です。レスポンスの認証Cookieは `__Host-flaxia_session`、`Secure`、`HttpOnly`、`SameSite=Lax` で、有効期間は7日です。
+ブラウザからのリクエストは `credentials: 'include'` を指定します。許可するOriginは `https://auth.flaxia.app` と `https://flaxia.app` です。POSTには許可された `Origin` が必要です。レスポンスの認証Cookieは `__Host-flaxia_session`、`Secure`、`HttpOnly`、`SameSite=Lax` で、有効期間は7日です。
 
 リクエストとレスポンスはJSONです。パスワードは送信せず、クライアントでSRPの値を計算します。文字列のバイナリ値は標準Base64です。SRPの計算は `src/srp.ts` を参照してください。新規の検証子には `srp_group: "2048"` と `srp_kdf: "pbkdf2-600k-v2"` を使用します。
 

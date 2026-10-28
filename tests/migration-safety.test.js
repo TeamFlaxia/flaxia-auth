@@ -6,7 +6,7 @@ import { test } from 'node:test';
 test('migration blocks old conversion and new conversion remains atomic', () => {
   const db = new DatabaseSync(':memory:');
   db.exec('PRAGMA foreign_keys = ON');
-  for (const name of ['0001_auth.sql', '0002_auth_rate_limits.sql', '0003_display_name.sql', '0004_flaxia_session_exchange.sql', '0005_bind_srp_handshakes.sql', '0006_legacy_fingerprint_retention.sql']) {
+  for (const name of ['0001_auth.sql', '0002_auth_rate_limits.sql', '0003_display_name.sql', '0004_flaxia_session_exchange.sql', '0005_bind_srp_handshakes.sql', '0006_legacy_fingerprint_retention.sql', '0007_guard_linked_credentials.sql']) {
     db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
   }
   db.exec("INSERT INTO users (id, username, password_hash) VALUES ('u', 'user', 'old-hash')");
@@ -19,5 +19,8 @@ test('migration blocks old conversion and new conversion remains atomic', () => 
   assert.ok(db.prepare("SELECT expires_at FROM flaxia_legacy_fingerprints WHERE user_id = 'u'").get().expires_at);
   db.exec("UPDATE flaxia_legacy_fingerprints SET expires_at = '2000-01-01T00:00:00.000Z' WHERE user_id = 'u'; DELETE FROM flaxia_legacy_fingerprints WHERE expires_at <= '2026-01-01T00:00:00.000Z'");
   assert.equal(db.prepare("SELECT count(*) AS n FROM flaxia_legacy_fingerprints").get().n, 0);
+  db.exec("INSERT INTO flaxia_credential_guards (user_id) VALUES ('u')");
+  assert.equal(db.prepare("SELECT count(*) AS n FROM flaxia_credential_guards WHERE user_id = 'u'").get().n, 1);
+  assert.equal(db.prepare("UPDATE users SET srp_salt = 'new' WHERE id = 'u' AND NOT EXISTS (SELECT 1 FROM flaxia_credential_guards WHERE user_id = users.id)").run().changes, 0);
   db.close();
 });

@@ -249,6 +249,15 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal((await (await request('/api/auth/reauth/verify', { cookie: authCookie, body: bridgeBody, ip: '192.0.2.13' })).json()).valid, false);
   assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', bridgeBody)).json()).valid, true);
   assert.equal((await (await bridgePost('/api/flaxia/reauth/verify', bridgeBody)).json()).valid, false);
+  const guardedStart = await request('/api/auth/reauth/start', { cookie: authCookie, body: {}, ip: '192.0.2.13' });
+  assert.equal(guardedStart.status, 200);
+  const guardedChallenge = await guardedStart.json();
+  const guardedFirst = await clientStep1(legacyPassword, decode(guardedChallenge.salt));
+  const guardedProof = await clientStep2(legacyPassword, decode(guardedChallenge.salt), guardedFirst.a, decode(guardedChallenge.B), guardedChallenge.srp_kdf);
+  const replacementSalt = generateSalt();
+  const replacementVerifier = await computeVerifier('replacement password', replacementSalt);
+  const guardedUpgrade = await request('/api/auth/upgrade-srp', { cookie: authCookie, ip: '192.0.2.13', body: { srp_salt: encode(replacementSalt), srp_verifier: encode(replacementVerifier), srp_group: '2048', srp_kdf: 'pbkdf2-600k-v2', current_srp: { challenge_id: guardedChallenge.challenge_id, A: encode(guardedProof.A), M1: encode(guardedProof.M1) } } });
+  assert.equal(guardedUpgrade.status, 409);
   assert.equal((await bridgePost('/api/flaxia/revoke', { grant: secondGrant.grant })).status, 200);
   assert.equal((await bridgePost('/api/flaxia/revoke', { grant: secondGrant.grant })).status, 200);
   assert.equal((await bridgePost('/api/flaxia/introspect', { grant: secondGrant.grant })).status, 401);

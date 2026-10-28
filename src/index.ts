@@ -99,6 +99,7 @@ bridge.post('/api/flaxia/exchange', bodyLimit({ maxSize: 1024 }), async c => {
       WHERE c.code_hash = ? AND c.challenge = ? AND c.expires_at > ? AND s.expires_at > ? AND u.frozen_at IS NULL
         AND COALESCE(u.srp_salt, '') <> '' AND COALESCE(u.srp_verifier, '') <> '' AND COALESCE(u.srp_group, '') <> ''`)
       .bind(grantHash, codeHash, challenge, now, now),
+    c.env.DB.prepare('INSERT OR IGNORE INTO flaxia_credential_guards (user_id) SELECT user_id FROM flaxia_session_grants WHERE token_hash = ?').bind(grantHash),
     c.env.DB.prepare('DELETE FROM flaxia_authorization_codes WHERE code_hash = ? AND challenge = ?').bind(codeHash, challenge),
   ]);
   if (result[0].meta.changes !== 1) return c.json({ error: 'Invalid authorization' }, 401);
@@ -218,11 +219,12 @@ app.post('/api/auth/login/legacy', async c => {
   const token = random();
   const result = await c.env.DB.batch([
     c.env.DB.prepare('INSERT INTO flaxia_legacy_fingerprints (user_id, fingerprint, expires_at) SELECT id, ?, ? FROM users WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL').bind(legacyStamp, expiry(90 * 86400000), user.id, user.password_hash),
+    c.env.DB.prepare('INSERT OR IGNORE INTO flaxia_credential_guards (user_id) SELECT user_id FROM flaxia_legacy_fingerprints WHERE user_id = ?').bind(user.id),
     c.env.DB.prepare("UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = '2048', srp_kdf = 'pbkdf2-600k-v2', password_hash = '' WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL")
       .bind(saltEncoded, verifierEncoded, user.id, user.password_hash),
     c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) SELECT ?, id, ? FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?').bind(token, expiry(7 * 86400000), user.id, saltEncoded, verifierEncoded),
   ]);
-  if (result[0].meta.changes !== 1 || result[1].meta.changes !== 1 || result[2].meta.changes !== 1) return c.json({ error: 'Invalid credentials' }, 401);
+  if (result[0].meta.changes !== 1 || result[2].meta.changes !== 1 || result[3].meta.changes !== 1) return c.json({ error: 'Invalid credentials' }, 401);
   setCookie(c, cookieName, token, { ...cookieOptions, maxAge: 7 * 86400 });
   return c.json({ user: { id: user.id, username: user.username, display_name: user.display_name } });
 });
@@ -325,10 +327,10 @@ app.post('/api/auth/upgrade-srp', async c => {
   if (!validCredentials(salt, verifier)) return c.json({ error: 'Invalid SRP parameters' }, 400);
   if (!await verifyProof(c.env.DB, user, body.current_srp, 'session-reauth', session)) return c.json({ error: 'Current password is incorrect' }, 401);
   const updated = await c.env.DB.batch([
-    c.env.DB.prepare('UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ? WHERE id = ? AND srp_verifier = ? AND srp_salt = ?').bind(salt, verifier, group, kdf, '', user.id, user.srp_verifier, user.srp_salt),
-    c.env.DB.prepare('DELETE FROM flaxia_legacy_fingerprints WHERE user_id = ? AND EXISTS (SELECT 1 FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?)').bind(user.id, user.id, salt, verifier),
+    c.env.DB.prepare('UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ? WHERE id = ? AND srp_verifier = ? AND srp_salt = ? AND NOT EXISTS (SELECT 1 FROM flaxia_credential_guards WHERE user_id = users.id)').bind(salt, verifier, group, kdf, '', user.id, user.srp_verifier, user.srp_salt),
+    c.env.DB.prepare('DELETE FROM flaxia_legacy_fingerprints WHERE user_id = ? AND changes() = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?)').bind(user.id, user.id, salt, verifier),
   ]);
-  if (!updated[0].meta.changes) return c.json({ error: 'Credentials changed' }, 409);
+  if (!updated[0].meta.changes) return c.json({ error: 'Credentials changed or linked to Flaxia' }, 409);
   return c.json({ success: true });
 });
 app.post('/api/auth/logout', async c => {

@@ -86,6 +86,30 @@ async function userForGrant(db: D1Database, grant: unknown): Promise<User | null
 // A one-time code is bound to a client-generated verifier, so intercepting it
 // alone cannot create a Flaxia session.
 bridge.get('/health', c => c.json({ status: 'ok' }));
+// Account freezes are controlled by the trusted Flaxia service binding only.
+// Freezing also revokes sessions so unfreezing cannot revive old grants.
+bridge.post('/api/flaxia/admin/account', bodyLimit({ maxSize: 1024 }), async c => {
+  c.header('Cache-Control', 'no-store');
+  let body: { user_id?: unknown; action?: unknown; reason?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body) ||
+      typeof body.user_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(body.user_id) ||
+      (body.action !== 'freeze' && body.action !== 'unfreeze')) return c.json({ error: 'Invalid request' }, 400);
+
+  if (body.action === 'freeze') {
+    if (typeof body.reason !== 'string' || !body.reason.trim() || body.reason.length > 500) return c.json({ error: 'Invalid reason' }, 400);
+    const result = await c.env.DB.batch([
+      c.env.DB.prepare('UPDATE users SET frozen_at = ?, frozen_reason = ? WHERE id = ?').bind(new Date().toISOString(), body.reason.trim(), body.user_id),
+      c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(body.user_id),
+      c.env.DB.prepare('DELETE FROM srp_handshakes WHERE user_id = ?').bind(body.user_id),
+    ]);
+    return result[0].meta.changes === 1 ? c.json({ success: true }) : c.json({ error: 'User not found' }, 404);
+  }
+
+  const result = await c.env.DB.prepare('UPDATE users SET frozen_at = NULL, frozen_reason = NULL WHERE id = ?').bind(body.user_id).run();
+  return result.meta.changes === 1 ? c.json({ success: true }) : c.json({ error: 'User not found' }, 404);
+});
+
 // The caller is the trusted Flaxia service binding. Repeating a request is
 // safe after a timeout; a conflicting identity is never modified or linked.
 bridge.post('/api/flaxia/provision', bodyLimit({ maxSize: 2048 }), async c => {

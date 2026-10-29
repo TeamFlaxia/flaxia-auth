@@ -6,7 +6,7 @@ import { test } from 'node:test';
 test('migration blocks old conversion and new conversion remains atomic', () => {
   const db = new DatabaseSync(':memory:');
   db.exec('PRAGMA foreign_keys = ON');
-  for (const name of ['0001_auth.sql', '0002_auth_rate_limits.sql', '0003_display_name.sql', '0004_flaxia_session_exchange.sql', '0005_bind_srp_handshakes.sql', '0006_legacy_fingerprint_retention.sql', '0007_guard_linked_credentials.sql']) {
+  for (const name of ['0001_auth.sql', '0002_auth_rate_limits.sql', '0003_display_name.sql', '0004_flaxia_session_exchange.sql', '0005_bind_srp_handshakes.sql', '0006_legacy_fingerprint_retention.sql', '0007_guard_linked_credentials.sql', '0008_deletion_receipts.sql', '0009_credential_changes.sql', '0010_credential_recovery_capability.sql', '0011_deletion_cancellations.sql', '0012_email_change_receipts.sql', '0013_recovery_factors.sql']) {
     db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
   }
   db.exec("INSERT INTO users (id, username, password_hash) VALUES ('u', 'user', 'old-hash')");

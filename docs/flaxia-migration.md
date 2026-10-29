@@ -1,24 +1,111 @@
 # Flaxia authentication migration
 
-Migration 0004 installs a database guard before the new Worker is deployed. During that interval, the old Worker's legacy conversion fails rather than deleting the only copy of a legacy hash. Deploy the new Worker promptly and monitor errors; affected users can retry after deployment. Do not remove the guard while old Worker versions or in-flight requests can still write. Rollbacks must preserve this rule.
+Flaxia Auth D1 is the authority for passwords, recovery factors, sessions and
+grant revocation. Flaxia D1 remains the application database for profiles,
+content and the encrypted Vault envelope. In direct authority mode, Flaxia D1
+does not retain password verifiers, SRP handshakes, Auth grants or recovery
+codes. It keeps only a profile-to-Auth link and hashed, retryable operation
+records; a password change may temporarily keep the encrypted Vault rewrap.
 
-The guard cannot recover hashes already removed before migration 0004. Before enabling the Flaxia integration, compare the Auth and Flaxia credential states and identify accounts already converted to SRP without a matching legacy fingerprint. Resolve those accounts through a separately verified recovery process; do not silently treat them as matching. Confirm the plan for new registrations, password changes and account deletion across both services before making Auth authoritative.
+## Account migration
 
-Legacy fingerprints are sensitive password-derived data. They are removed on credential change or account deletion. Migration 0006 sets a 90-day expiry from creation (existing rows receive 90 days from migration). The exchange rejects expired fingerprints even before the hourly cleanup deletes them. After expiry, affected users need a separately verified recovery process. Monitor expiry and complete account migration before the deadline. Restrict database and backup access and cover backups in the retention decision.
+Existing accounts link only when the Auth identity and Flaxia profile refer to
+the same account and their credential fingerprints match. The exchange uses a
+credential proof; names and email addresses alone never link accounts. A
+successful link purges the Flaxia verifier, legacy hash, local sessions, SRP
+handshakes, Auth grant snapshots and provisioning snapshot. Auth deletes the
+legacy fingerprint at link completion. Repeating an exchange after an
+interrupted request is safe.
 
-An hourly Worker cron deletes expired authorization codes and Auth sessions; grants attached to deleted sessions are removed by foreign-key cascade. Monitor cron failures and database growth. A failed cron delays physical cleanup but does not extend authorization validity.
+The service-bound provisioning endpoint can copy a local SRP verifier to Auth
+for a retry-safe migration. It does not overwrite an existing Auth identity.
+A provisioning guard pauses local credential changes and deletion until the
+first successful Auth exchange links and purges the account. Keep authority
+mode disabled until inventory confirms every eligible account is linked, each
+user has an Auth recovery factor, and clients use the Auth login. Accounts
+whose local password is no longer available as an SRP verifier, whose Auth and
+Flaxia identities conflict, or whose fingerprints expired require verified
+account recovery before rollout. Matching a username or email is never enough.
+The current deployment has no automated two-account merge path; keep those
+accounts out of the rollout until a separately verified process resolves them.
 
-## Restore and removal procedure
+## Registration and recovery
 
-The live database retains each fingerprint for at most 90 days from its creation; existing rows receive a 90-day window when migration 0006 is applied. Hourly cleanup removes expired rows, and exchanges refuse them immediately at expiry. Restrict backups containing these rows to the same administrators as the live Auth database and expire each backup no later than 90 days after the backup is taken. Record and verify the storage provider's backup deletion configuration; the application cannot erase provider-managed backups.
+New registration creates the credential only in Auth. The authenticated Auth
+identity creates or links its Flaxia application profile; a conflicting
+username or email fails closed. Existing users enroll an independent,
+browser-generated 256-bit recovery code while they still know their password.
+Auth stores only the SRP salt and verifier for that code. Recovery verifies the
+code through SRP, revokes prior Auth sessions and outstanding handshakes, and
+lets the user set a new password. The browser separately uses the Vault
+recovery phrase to rewrap the Vault key. Neither recovery secret is sent to
+Flaxia or Auth.
 
-Before a restored database is connected to any Worker, apply all migrations and run this on the isolated restored database:
+## Credential and email changes
+
+Password changes require an Auth SRP proof. Auth stores the new verifier and a
+short-lived recovery capability. Flaxia stores an operation hash and the
+encrypted Vault rewrap, applies that rewrap atomically, then Auth commits the
+verifier and revokes other sessions. Retries reconcile either side after a
+timeout; cancellation tombstones prevent an old delayed request from applying
+later. A successful change deletes the legacy fingerprint immediately.
+
+Email changes reserve the new Flaxia profile address, then update Auth after
+SRP proof. A hashed Auth receipt lets Flaxia finish the profile update after a
+lost reply. Email is not a recovery factor and is not treated as verified.
+
+## Deletion
+
+Deletion requires an Auth SRP proof. Auth records a hashed receipt and revokes
+the grant. Flaxia's deletion job stores a user ID and operation hash, then
+removes application data atomically after Auth confirms the receipt. The
+browser and scheduled Worker can retry. Cancellation tombstones prevent a
+delayed delete after cancellation. Unreferenced profile images enter a durable
+R2 deletion outbox; references are blocked while an object is queued, failed
+deletes retry, and successful deletion removes the outbox row. Account
+deletion cascades the Auth recovery verifier and removes any fingerprint.
+
+## Fingerprint retention and purge
+
+Legacy fingerprints are sensitive password-derived values that support the
+one-time legacy credential comparison. Migration 0006 sets a 90-day expiry;
+existing rows receive 90 days from the migration. Exchanges reject expired
+fingerprints immediately, while the hourly Auth Worker cron physically deletes
+expired rows. Linking, a successful credential change and account deletion
+delete the fingerprint earlier.
+
+Keep backups containing fingerprints for no longer than 90 days from the
+backup date. Verify the storage provider's backup-retention setting before
+rollout; application code cannot delete provider-managed backups. Before
+connecting a restored database to any Worker, apply migrations and purge
+expired rows on the isolated restore:
 
 ```sql
 DELETE FROM flaxia_legacy_fingerprints
 WHERE expires_at IS NULL OR expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
 ```
 
-Then confirm `SELECT count(*) FROM flaxia_legacy_fingerprints WHERE expires_at IS NULL OR expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')` returns zero. Run the same deletion on the live database for an emergency purge, followed by the count check. For early removal of all fingerprints after the transition is complete, use `DELETE FROM flaxia_legacy_fingerprints` and confirm the table is empty; this immediately disables legacy account matching. Do not perform this early purge until affected users have a verified recovery path. Record the purge and make sure no old Worker remains active before reopening the service.
+Confirm the following count is zero before opening traffic:
 
-Migration 0007 records users whose Auth credentials may be shared with Flaxia. Legacy conversion and successful code redemption record this guard atomically, and existing grants and fingerprints are backfilled. The standalone Auth SRP upgrade rejects guarded users until a coordinated credential-change flow exists; the record survives grant and fingerprint cleanup. A redeemed code can create the guard even if Flaxia later rejects the exchange. Accounts whose grants and fingerprints were already removed before migration cannot be identified by this backfill and require separate inventory before rollout. This guard is a temporary safety measure, not a completed password-change or recovery flow.
+```sql
+SELECT count(*) FROM flaxia_legacy_fingerprints
+WHERE expires_at IS NULL OR expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+```
+
+For an emergency purge, run the same delete and count check against the live
+database. After every affected account has migrated or has a verified recovery
+path, the entire table can be purged with `DELETE FROM
+flaxia_legacy_fingerprints`; confirm it is empty and stop old Worker versions
+before reopening service. Record the purge and verify the hourly cron is
+healthy. A cron failure delays physical cleanup but does not extend exchange
+validity.
+
+## Rollback and release gate
+
+Do not roll back to a Worker that accepts Flaxia-local credentials after an
+account's local verifier has been purged. A rollback must preserve Auth as the
+credential authority or restore access through the verified Auth recovery
+flow. Keep authority mode disabled until migration inventory, backup expiry,
+scheduled Worker bindings and independent security review are verified.
+These operational and identity-conflict gates are not established by the code
+changes alone.

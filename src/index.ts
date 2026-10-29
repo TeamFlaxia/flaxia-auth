@@ -94,7 +94,12 @@ bridge.post('/api/flaxia/admin/account', bodyLimit({ maxSize: 1024 }), async c =
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
   if (!body || typeof body !== 'object' || Array.isArray(body) ||
       typeof body.user_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(body.user_id) ||
-      (body.action !== 'freeze' && body.action !== 'unfreeze')) return c.json({ error: 'Invalid request' }, 400);
+      (body.action !== 'freeze' && body.action !== 'unfreeze' && body.action !== 'delete')) return c.json({ error: 'Invalid request' }, 400);
+
+  if (body.action === 'delete') {
+    await c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(body.user_id).run();
+    return c.json({ success: true });
+  }
 
   if (body.action === 'freeze') {
     if (typeof body.reason !== 'string' || !body.reason.trim() || body.reason.length > 500) return c.json({ error: 'Invalid reason' }, 400);

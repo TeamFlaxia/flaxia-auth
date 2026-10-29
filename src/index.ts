@@ -656,7 +656,9 @@ app.post('/api/auth/login/verify', async c => {
     if (!proof) return c.json({ error: 'Invalid credentials' }, 401);
     if (user.frozen_at) return c.json({ error: 'account_frozen', username: user.username, M2: enc(proof.M2) }, 403);
     const token = random();
-    await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)').bind(token, user.id, expiry(7 * 86400000)).run();
+    const session = await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) SELECT ?, id, ? FROM users WHERE id = ? AND srp_salt IS ? AND srp_verifier = ? AND srp_group IS ? AND srp_kdf IS ? AND frozen_at IS NULL')
+      .bind(token, expiry(7 * 86400000), user.id, user.srp_salt, user.srp_verifier, user.srp_group, user.srp_kdf).run();
+    if (session.meta.changes !== 1) return c.json({ error: 'Invalid credentials' }, 401);
     setCookie(c, cookieName, token, { ...cookieOptions, maxAge: 7 * 86400 });
     return c.json({ M2: enc(proof.M2), user: { id: user.id, username: user.username, display_name: user.display_name } });
   } catch { return c.json({ error: 'Invalid credentials' }, 401); }

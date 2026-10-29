@@ -50,6 +50,7 @@ test('login cannot create a session after its verifier was replaced and sessions
   const replacementSalt = generateSalt();
   const replacementVerifier = await computeVerifier('new race-test password', replacementSalt);
   const login = await post('/api/auth/login/verify', { challenge_id: hs.challenge_id, A: enc(proof.A), M1: enc(proof.M1) }, { 'X-Test-Replacement': `${enc(replacementSalt)}:${enc(replacementVerifier)}` });
+  assert.equal(login.headers.get('X-Test-Interleaved'), 'yes', 'The credential replacement must actually run');
   assert.equal(login.status, 401, 'A verifier replaced during verification must not issue a session');
   assert.equal(login.headers.get('set-cookie'), null);
 });

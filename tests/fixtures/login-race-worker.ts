@@ -2,7 +2,7 @@
 import app from '../../src/index';
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const replacement = request.headers.get('X-Test-Replacement');
     if (!replacement) return app.fetch(request, env, ctx);
     const [salt, verifier] = replacement.split(':');
@@ -52,6 +52,8 @@ export default {
         };
       },
     });
-    return app.fetch(request, { ...env, DB: wrapped }, ctx);
+    const response = await app.fetch(request, { ...env, DB: wrapped }, ctx);
+    response.headers.set('X-Test-Interleaved', injected ? 'yes' : 'no');
+    return response;
   },
 };

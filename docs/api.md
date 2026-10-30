@@ -58,4 +58,17 @@ Base URL: `https://auth.flaxia.app`
 
 認証APIはリクエスト元IPごとに各パスで毎分20回、SRPログイン開始と旧方式ログインはそれぞれユーザーごとに毎分5回までです。超過時は429を返します。
 
-`/api/auth/login/start` が `{ "srp": false }` を返した場合に限り、旧方式のアカウントとして `POST /api/auth/login/legacy` に `{ "username", "password" }` を送り、初回のみ既存パスワードでログインします。成功すると同じパスワードのSRP検証子を作成し、旧ハッシュを削除してセッションを発行します。以後はSRPログインを使ってください。既にSRPへ移行済みのアカウントはこのエンドポイントを使えません。
+`/api/auth/login/start` が `{ "srp": false }` を返した場合に限り、旧方式のアカウントとして `POST /api/auth/login/legacy` に次を送ります。
+
+```json
+{
+  "username": "example_user",
+  "password": "現在のパスワード",
+  "srp_salt": "<Base64の16バイトのsalt>",
+  "srp_verifier": "<Base64の256バイトのverifier>",
+  "srp_group": "2048",
+  "srp_kdf": "pbkdf2-600k-v2"
+}
+```
+
+`srp_salt` と `srp_verifier` はブラウザ側で現在のパスワードから計算します。Cloudflare Workers の WebCrypto は PBKDF2 の反復回数が100,000回以下のため、サーバー側では600,000回のv2検証子を計算できません。サーバーは旧パスワードを検証したうえで、受け取った検証子を保存し、旧ハッシュを削除してセッションを発行します。以後はSRPログインを使ってください。既にSRPへ移行済みのアカウントはこのエンドポイントを使えません。

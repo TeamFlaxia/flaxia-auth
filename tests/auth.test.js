@@ -29,6 +29,9 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   const legacySalt = generateSalt();
   const legacyVerifier = await computeVerifier('legacy password', legacySalt, 'sha256-v1');
   const legacyPassword = 'legacy account password';
+  const legacyUpgradeSalt = generateSalt();
+  const legacyUpgradeVerifier = await computeVerifier(legacyPassword, legacyUpgradeSalt);
+  const legacyUpgrade = { srp_salt: encode(legacyUpgradeSalt), srp_verifier: encode(legacyUpgradeVerifier), srp_group: '2048', srp_kdf: 'pbkdf2-600k-v2' };
   const oldSalt = crypto.getRandomValues(new Uint8Array(16));
   const legacyHash = Buffer.concat([Buffer.from(oldSalt), pbkdf2Sync(legacyPassword, oldSalt, 100000, 32, 'sha256')]).toString('base64');
   const seedSql = `INSERT INTO users (id, username, email, srp_salt, srp_verifier, srp_group, srp_kdf) VALUES ('legacy-id', 'LegacyUser', 'legacy@example.com', '${encode(legacySalt)}', '${encode(legacyVerifier)}', '2048', 'sha256-v1'); INSERT INTO users (id, username, srp_salt, srp_verifier, frozen_at) VALUES ('frozen-id', 'FrozenUser', '${encode(legacySalt)}', '${encode(legacyVerifier)}', '2026-01-01T00:00:00.000Z'); INSERT INTO users (id, username, password_hash) VALUES ('needs-upgrade', 'OldUser', '${legacyHash}'), ('race-user', 'RaceUser', '${legacyHash}'); INSERT INTO users (id, username, password_hash, frozen_at) VALUES ('frozen-legacy', 'FrozenLegacy', '${legacyHash}', '2026-01-01T00:00:00.000Z')`;
@@ -177,7 +180,8 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal((await request(legacyEndpoint, { body: { username: 'LegacyUser', password: 'legacy password' }, ip: '192.0.2.13' })).status, 401);
   assert.equal((await request(legacyEndpoint, { body: { username: 'FrozenLegacy', password: legacyPassword }, ip: '192.0.2.13' })).status, 403);
   assert.equal((await request(legacyEndpoint, { body: { username: 'OldUser', password: legacyPassword }, origin: 'https://evil.example' })).status, 403);
-  const converted = await request(legacyEndpoint, { body: { username: 'olduser', password: legacyPassword }, ip: '192.0.2.13' });
+  assert.equal((await request(legacyEndpoint, { body: { username: 'OldUser', password: legacyPassword }, ip: '192.0.2.13' })).status, 400);
+  const converted = await request(legacyEndpoint, { body: { username: 'olduser', password: legacyPassword, ...legacyUpgrade }, ip: '192.0.2.13' });
   assert.equal(converted.status, 200);
   assert.equal((await converted.json()).user.id, 'needs-upgrade');
   const legacyCookie = converted.headers.get('set-cookie');
@@ -321,7 +325,7 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   query("UPDATE users SET srp_group = '2048' WHERE id = 'needs-upgrade'");
   assert.equal((await request('/api/auth/logout', { cookie: authCookie, ip: '192.0.2.13' })).status, 200);
   assert.equal((await introspect()).status, 401);
-  const races = await Promise.all([1, 2].map(i => request(legacyEndpoint, { body: { username: 'RaceUser', password: legacyPassword }, ip: `192.0.2.${40 + i}` })));
+  const races = await Promise.all([1, 2].map(i => request(legacyEndpoint, { body: { username: 'RaceUser', password: legacyPassword, ...legacyUpgrade }, ip: `192.0.2.${40 + i}` })));
   assert.deepEqual(races.map(r => r.status).sort(), [200, 401]);
   for (let i = 0; i < 4; i++) assert.equal((await request('/api/auth/login/start', { body: { username: 'legacyuser' }, ip: `192.0.2.${30 + i}` })).status, 200);
   assert.equal((await request('/api/auth/login/start', { body: { username: 'legacyuser' }, ip: '192.0.2.39' })).status, 429);

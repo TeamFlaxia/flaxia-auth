@@ -3,7 +3,7 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { cors } from 'hono/cors';
 import { bodyLimit } from 'hono/body-limit';
-import { computeVerifier, generateSalt, isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, serverStep2 } from './srp';
+import { isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, serverStep2 } from './srp';
 import { originAllowed } from './origin';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -582,25 +582,27 @@ app.post('/api/auth/register', async c => {
 });
 
 // This temporary endpoint accepts a password only for pre-SRP accounts.
-// Successful verification immediately replaces the old hash with an SRP verifier.
+// Successful verification immediately replaces the old hash with an SRP
+// verifier. The browser computes the verifier because Workers WebCrypto
+// rejects PBKDF2 iteration counts above 100,000, so the 600k v2 KDF cannot be
+// derived server-side.
 app.post('/api/auth/login/legacy', async c => {
-  let body: { username?: unknown; password?: unknown };
+  let body: { username?: unknown; password?: unknown; srp_salt?: unknown; srp_verifier?: unknown; srp_group?: unknown; srp_kdf?: unknown };
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
   if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.username !== 'string' || !/^[a-zA-Z0-9_]{1,20}$/.test(body.username) || typeof body.password !== 'string' || body.password.length === 0 || body.password.length > 1024) return c.json({ error: 'Invalid request' }, 400);
   if (await rateLimit(c.env.DB, `legacy-login:user:${body.username.toLowerCase()}`, 5)) return c.json({ error: 'Too many requests' }, 429);
   const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').bind(body.username).first<User>();
   if (!user || user.srp_salt !== null || user.srp_verifier !== null || !user.password_hash || !await verifyLegacyPassword(body.password, user.password_hash)) return c.json({ error: 'Invalid credentials' }, 401);
   if (user.frozen_at) return c.json({ error: 'account_frozen', username: user.username }, 403);
-  const salt = generateSalt();
-  const verifier = await computeVerifier(body.password, salt, 'pbkdf2-600k-v2');
-  const saltEncoded = enc(salt), verifierEncoded = enc(verifier);
+  const { srp_salt: saltEncoded, srp_verifier: verifierEncoded, srp_group: group, srp_kdf: kdf } = body;
+  if (typeof saltEncoded !== 'string' || typeof verifierEncoded !== 'string' || saltEncoded.length > 32 || verifierEncoded.length > 400 || group !== '2048' || !isCreatableSrpKdf(kdf) || !validCredentials(saltEncoded, verifierEncoded)) return c.json({ error: 'SRP upgrade required' }, 400);
   const legacyStamp = await sha256url(JSON.stringify(['legacy', user.password_hash]));
   const token = random();
   const result = await c.env.DB.batch([
     c.env.DB.prepare('INSERT INTO flaxia_legacy_fingerprints (user_id, fingerprint, expires_at) SELECT id, ?, ? FROM users WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL').bind(legacyStamp, expiry(90 * 86400000), user.id, user.password_hash),
     c.env.DB.prepare('INSERT OR IGNORE INTO flaxia_credential_guards (user_id) SELECT user_id FROM flaxia_legacy_fingerprints WHERE user_id = ?').bind(user.id),
-    c.env.DB.prepare("UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = '2048', srp_kdf = 'pbkdf2-600k-v2', password_hash = '' WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL")
-      .bind(saltEncoded, verifierEncoded, user.id, user.password_hash),
+    c.env.DB.prepare('UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ? WHERE id = ? AND password_hash = ? AND srp_salt IS NULL AND srp_verifier IS NULL AND frozen_at IS NULL')
+      .bind(saltEncoded, verifierEncoded, group, kdf, '', user.id, user.password_hash),
     c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) SELECT ?, id, ? FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?').bind(token, expiry(7 * 86400000), user.id, saltEncoded, verifierEncoded),
   ]);
   if (result[0].meta.changes !== 1 || result[2].meta.changes !== 1 || result[3].meta.changes !== 1) return c.json({ error: 'Invalid credentials' }, 401);

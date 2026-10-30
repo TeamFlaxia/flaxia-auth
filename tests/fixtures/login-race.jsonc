@@ -1,0 +1,11 @@
+{
+  "name": "auth-login-race-test",
+  "main": "login-race-worker.ts",
+  "compatibility_date": "2026-10-28",
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "flaxia-auth-prod",
+    "database_id": "9ad903d0-dd62-4b88-bc98-d078d2176e61",
+    "migrations_dir": "../../migrations"
+  }]
+}

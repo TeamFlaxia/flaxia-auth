@@ -3,6 +3,7 @@
   "name": "flaxia-auth",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-28",
+  "triggers": { "crons": ["0 * * * *"] },
   "routes": [
     {
       "pattern": "auth.flaxia.app",

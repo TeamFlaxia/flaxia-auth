@@ -1,11 +1,32 @@
 # Flaxia authentication migration
 
-Flaxia Auth D1 is the authority for passwords, recovery factors, sessions and
-grant revocation. Flaxia D1 remains the application database for profiles,
-content and the encrypted Vault envelope. In direct authority mode, Flaxia D1
-does not retain password verifiers, SRP handshakes, Auth grants or recovery
-codes. It keeps only a profile-to-Auth link and hashed, retryable operation
-records; a password change may temporarily keep the encrypted Vault rewrap.
+Flaxia Auth D1 is the authority for passwords, recovery factors, sessions,
+grant revocation and the Personal Vault envelope. Flaxia D1 remains the
+application database for profiles, content and, during the transitional
+period, any Vault rows created before the Auth-owned store was deployed. In
+direct authority mode, Flaxia D1 does not retain password verifiers, SRP
+handshakes, Auth grants or recovery codes. It keeps only a profile-to-Auth
+link and hashed, retryable operation records. New Vault writes go through Auth
+at `/api/vault/*` or the service-bound `/api/flaxia/vault` proxy; no Vault
+secret or wrapped item is copied into Flaxia during a credential change.
+
+## Vault cutover
+
+When `AUTH_AUTHORITY_MODE=flaxia-auth`, Flaxia's existing `/api/vault/*`
+routes become a proxy to Auth. The first request for a user who still has rows
+in Flaxia D1 copies the envelope, device rows and encrypted items through
+`POST /api/flaxia/vault/import`. The import is idempotent, rejects a different
+existing envelope, and the local rows are deleted only after Auth confirms the
+same envelope. Everything transferred is already client-wrapped ciphertext;
+the password, KEK, REK, VK, item keys and recovery phrase never leave the
+browser.
+
+Password changes consult the Auth-owned version and send the encrypted rewrap
+with the prepared credential change. Auth applies the verifier, envelope and
+item-version bump in one transaction. Flaxia no longer stages a rewrap for an
+Auth-owned Vault; the old `flaxia_direct_vault_changes` and
+`flaxia_auth_credential_jobs.vault_json` paths remain only for accounts that
+have not completed the import.
 
 ## Account migration
 
@@ -44,11 +65,14 @@ Flaxia or Auth.
 ## Credential and email changes
 
 Password changes require an Auth SRP proof. Auth stores the new verifier and a
-short-lived recovery capability. Flaxia stores an operation hash and the
-encrypted Vault rewrap, applies that rewrap atomically, then Auth commits the
-verifier and revokes other sessions. Retries reconcile either side after a
-timeout; cancellation tombstones prevent an old delayed request from applying
-later. A successful change deletes the legacy fingerprint immediately.
+short-lived recovery capability. The browser sends the encrypted Vault rewrap
+with the same operation; Auth applies the new verifier, the VK rewrap and the
+item-version bump in one D1 transaction, then revokes other sessions. Retries
+reconcile either side after a timeout; cancellation tombstones prevent an old
+delayed request from applying later. A successful change deletes the legacy
+fingerprint immediately. Flaxia no longer needs to stage the rewrap in its own
+database for new Vault rows; that staging path remains only for pre-migration
+rows that have not been copied to Auth yet.
 
 Email changes reserve the new Flaxia profile address, then update Auth after
 SRP proof. A hashed Auth receipt lets Flaxia finish the profile update after a

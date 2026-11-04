@@ -69,6 +69,14 @@ async function verifyProof(db: D1Database, user: User, input: unknown, purpose: 
 }
 app.get('/health', c => c.json({ service: 'flaxia-auth', status: 'ok' }));
 
+// The login UI lives on the Auth origin. `/register` is the same document; the
+// client selects the registration tab from the path.
+const loginPage = (c: { env: Env; req: { url: string } }) =>
+  c.env.ASSETS.fetch(new URL('/login.html', c.req.url));
+app.get('/', loginPage);
+app.get('/login', loginPage);
+app.get('/register', loginPage);
+
 async function credentialStamp(db: D1Database, userId: string): Promise<string | null> {
   const user = await db.prepare('SELECT srp_salt, srp_verifier, srp_group, srp_kdf FROM users WHERE id = ? AND frozen_at IS NULL').bind(userId).first<User>();
   if (!user?.srp_salt || !user.srp_verifier || !user.srp_group) return null;
@@ -653,6 +661,29 @@ app.post('/api/auth/recovery/verify', async c => {
     setCookie(c, cookieName, token, { ...cookieOptions, maxAge: 7 * 86400 });
     return c.json({ M2: enc(proof.M2), user: { id: hs.user_id, username: factor.username, display_name: factor.display_name } });
   } catch { return c.json({ error: 'Recovery unavailable' }, 401); }
+});
+
+// Enroll or replace the recovery factor from the login UI. The current
+// password is proven with a session-bound SRP handshake, exactly like the
+// service-binding path Flaxia uses after sign-in.
+app.post('/api/auth/recovery/enroll', async c => {
+  const session = getCookie(c, cookieName);
+  const user = await sessionUser(c.env.DB, session);
+  if (!user || !session) return c.json({ error: 'Unauthenticated' }, 401);
+  if (await rateLimit(c.env.DB, `recovery-enroll:user:${user.id}`, 10)) return c.json({ error: 'Too many requests' }, 429);
+  let body: { salt?: unknown; verifier?: unknown; kdf?: unknown; current_srp?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (typeof body.salt !== 'string' || typeof body.verifier !== 'string' || !isCreatableSrpKdf(body.kdf) || !validCredentials(body.salt, body.verifier)) return c.json({ error: 'Invalid recovery verifier' }, 400);
+  if (!await verifyProof(c.env.DB, user, body.current_srp, 'session-reauth', session)) return c.json({ error: 'Current password is incorrect' }, 401);
+  const result = await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO auth_recovery_factors (user_id, srp_salt, srp_verifier, srp_kdf)
+      SELECT id, ?, ?, ? FROM users WHERE id = ? AND frozen_at IS NULL AND srp_salt IS ? AND srp_verifier IS ?
+      ON CONFLICT(user_id) DO UPDATE SET srp_salt = excluded.srp_salt, srp_verifier = excluded.srp_verifier, srp_kdf = excluded.srp_kdf`)
+      .bind(body.salt, body.verifier, body.kdf, user.id, user.srp_salt, user.srp_verifier),
+    c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND id != ? AND changes() = 1').bind(user.id, session),
+    c.env.DB.prepare("DELETE FROM srp_handshakes WHERE user_id = ? AND purpose IN ('recovery-login', 'grant-recovery') AND EXISTS (SELECT 1 FROM auth_recovery_factors WHERE user_id = ? AND srp_salt = ? AND srp_verifier = ?)").bind(user.id, user.id, body.salt, body.verifier),
+  ]);
+  return result[0].meta.changes === 1 ? c.json({ success: true }) : c.json({ error: 'Credentials or session changed' }, 409);
 });
 
 app.post('/api/auth/login/start', async c => {

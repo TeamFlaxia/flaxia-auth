@@ -73,6 +73,9 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal(preflight.status, 204);
   assert.equal(preflight.headers.get('access-control-allow-origin'), 'https://flaxia.app');
   assert.equal(preflight.headers.get('access-control-allow-credentials'), 'true');
+  const loginPage = await fetch(`${base}/login`);
+  assert.equal(loginPage.status, 200);
+  assert.match(await loginPage.text(), /Flaxia/);
   assert.equal(originAllowed('https://auth.flaxia.app'), true);
   assert.equal(originAllowed('https://id.flaxia.app'), false);
   const deniedPreflight = await fetch(`${base}/api/auth/register`, { method: 'OPTIONS', headers: { Origin: 'https://evil.example', 'Access-Control-Request-Method': 'POST' } });

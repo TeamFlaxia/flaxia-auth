@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Sign in · Flaxia</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; min-height: 100vh; display: grid; place-items: center;
+        background: #0f1115; color: #e7e9ee;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main { width: min(420px, calc(100vw - 32px)); padding: 28px; background: #171a21; border: 1px solid #262b36; border-radius: 16px; }
+      h1 { margin: 0 0 4px; font-size: 22px; }
+      p.sub { margin: 0 0 20px; color: #9aa3b2; font-size: 14px; }
+      .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid #262b36; }
+      .tabs button { flex: 1; padding: 10px 8px; background: none; border: 0; color: #9aa3b2; font: inherit; cursor: pointer; border-bottom: 2px solid transparent; }
+      .tabs button[aria-selected="true"] { color: #e7e9ee; border-bottom-color: #22c55e; }
+      label { display: block; margin: 14px 0 6px; font-size: 13px; color: #aab3c2; }
+      input[type="text"], input[type="password"] {
+        width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid #313846;
+        background: #0f1115; color: #e7e9ee; font: inherit;
+      }
+      input:focus { outline: 2px solid #22c55e55; border-color: #22c55e; }
+      button.primary {
+        width: 100%; margin-top: 20px; padding: 12px; border: 0; border-radius: 10px;
+        background: #22c55e; color: #04130a; font: inherit; font-weight: 700; cursor: pointer;
+      }
+      button.primary:disabled { opacity: .6; cursor: default; }
+      #error { margin-top: 16px; padding: 10px 12px; border-radius: 10px; background: #3b1418; color: #ffb4b4; font-size: 13px; }
+      #recovery-step { margin-top: 4px; }
+      code { display: block; margin: 10px 0; padding: 14px; background: #0f1115; border: 1px dashed #3a4252; border-radius: 10px; word-break: break-all; font-size: 13px; color: #b8f5c9; }
+      .notice { font-size: 12px; color: #9aa3b2; margin-top: 16px; }
+      .checkbox { display: flex; gap: 8px; align-items: flex-start; margin-top: 12px; font-size: 13px; color: #c7ceda; }
+      .hidden { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Flaxia</h1>
+      <p class="sub">Sign in to continue.</p>
+
+      <div class="tabs" role="tablist">
+        <button type="button" data-tab="login" role="tab">Sign in</button>
+        <button type="button" data-tab="register" role="tab">Create account</button>
+        <button type="button" data-tab="recover" role="tab">Recovery</button>
+      </div>
+
+      <div id="error" role="alert" hidden></div>
+
+      <form id="login-form" data-panel="login">
+        <label for="login-username">Username</label>
+        <input id="login-username" name="username" type="text" autocomplete="username" required maxlength="20" />
+        <label for="login-password">Password</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required />
+        <button class="primary" type="submit">Sign in</button>
+        <p class="notice">Passwords are never sent to the server. Sign-in uses SRP-6a.</p>
+      </form>
+
+      <form id="register-form" data-panel="register" hidden>
+        <label for="register-username">Username</label>
+        <input id="register-username" name="username" type="text" autocomplete="username" required maxlength="20" pattern="[A-Za-z0-9_]+" />
+        <label for="register-display">Display name</label>
+        <input id="register-display" name="display_name" type="text" required maxlength="50" />
+        <label for="register-password">Password</label>
+        <input id="register-password" name="password" type="password" autocomplete="new-password" required />
+        <label for="register-confirm">Confirm password</label>
+        <input id="register-confirm" name="confirm" type="password" autocomplete="new-password" required />
+        <button class="primary" type="submit">Create account</button>
+      </form>
+
+      <div id="recovery-step" hidden>
+        <p class="sub">Save this recovery code. It is the only way to recover the account if you forget the password.</p>
+        <code id="recovery-code"></code>
+        <label class="checkbox"><input id="recovery-saved" type="checkbox" /> I have saved this recovery code somewhere safe.</label>
+        <button class="primary" id="recovery-continue" type="button">Continue</button>
+      </div>
+
+      <form id="recover-form" data-panel="recover" hidden>
+        <label for="recover-username">Username</label>
+        <input id="recover-username" name="username" type="text" autocomplete="username" required maxlength="20" />
+        <label for="recover-code">Recovery code</label>
+        <input id="recover-code" name="recovery_code" type="text" autocomplete="off" required />
+        <button class="primary" type="submit">Recover account</button>
+      </form>
+    </main>
+    <script type="module" src="/auth.js"></script>
+  </body>
+</html>

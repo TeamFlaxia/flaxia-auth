@@ -20,6 +20,7 @@ Base URL: `https://auth.flaxia.app`
 | POST | `/api/auth/reauth/start` | 現在のユーザーの再認証を開始 |
 | POST | `/api/auth/reauth/verify` | 再認証の証明を検証 |
 | POST | `/api/auth/upgrade-srp` | 本人確認後にSRP情報を更新 |
+| POST | `/api/auth/recovery/enroll` | ログイン中のセッションで復旧コードを登録・更新 |
 
 ## 登録
 
@@ -72,3 +73,27 @@ Base URL: `https://auth.flaxia.app`
 ```
 
 `srp_salt` と `srp_verifier` はブラウザ側で現在のパスワードから計算します。Cloudflare Workers の WebCrypto は PBKDF2 の反復回数が100,000回以下のため、サーバー側では600,000回のv2検証子を計算できません。サーバーは旧パスワードを検証したうえで、受け取った検証子を保存し、旧ハッシュを削除してセッションを発行します。以後はSRPログインを使ってください。既にSRPへ移行済みのアカウントはこのエンドポイントを使えません。
+
+## ログイン画面
+
+`GET /login` と `GET /register` は Auth が配信するログイン UI を返します。画面は
+クエリの `code_challenge`（S256）、`state`、`return_uri` を受け取り、ログイン成功後に
+`POST /api/auth/flaxia/authorize` で取得した一度限りの `code` を付けて
+`return_uri` へ遷移します。`return_uri` は `src/origin.ts` の許可リストに完全一致
+するものだけを受け付けます。詳しい背景は [login-ui.md](login-ui.md) を参照してください。
+
+## 復旧コードの登録
+
+`POST /api/auth/recovery/enroll` はログイン済みセッションと、現在のパスワードを
+証明する SRP の `current_srp` を必要とします。
+
+```json
+{
+  "salt": "<Base64の16バイトのsalt>",
+  "verifier": "<Base64の256バイトのverifier>",
+  "kdf": "pbkdf2-600k-v2",
+  "current_srp": { "challenge_id": "...", "A": "...", "M1": "..." }
+}
+```
+
+成功時は `{ "success": true }` を返し、現在のセッション以外のセッションを失効させます。

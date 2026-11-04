@@ -52,8 +52,8 @@
       <div id="error" role="alert" hidden></div>
 
       <form id="login-form" data-panel="login">
-        <label for="login-username">Username</label>
-        <input id="login-username" name="username" type="text" autocomplete="username" required maxlength="20" />
+        <label for="login-username">Username or email</label>
+        <input id="login-username" name="username" type="text" autocomplete="username" autocapitalize="none" required maxlength="254" />
         <label for="login-password">Password</label>
         <input id="login-password" name="password" type="password" autocomplete="current-password" required />
         <button class="primary" type="submit">Sign in</button>
@@ -63,6 +63,8 @@
       <form id="register-form" data-panel="register" hidden>
         <label for="register-username">Username</label>
         <input id="register-username" name="username" type="text" autocomplete="username" required maxlength="20" pattern="[A-Za-z0-9_]+" />
+        <label for="register-email">Email (optional)</label>
+        <input id="register-email" name="email" type="email" autocomplete="email" maxlength="254" />
         <label for="register-display">Display name</label>
         <input id="register-display" name="display_name" type="text" required maxlength="50" />
         <label for="register-password">Password</label>
@@ -80,8 +82,8 @@
       </div>
 
       <form id="recover-form" data-panel="recover" hidden>
-        <label for="recover-username">Username</label>
-        <input id="recover-username" name="username" type="text" autocomplete="username" required maxlength="20" />
+        <label for="recover-username">Username or email</label>
+        <input id="recover-username" name="username" type="text" autocomplete="username" autocapitalize="none" required maxlength="254" />
         <label for="recover-code">Recovery code</label>
         <input id="recover-code" name="recovery_code" type="text" autocomplete="off" required />
         <button class="primary" type="submit">Recover account</button>

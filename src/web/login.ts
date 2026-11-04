@@ -156,12 +156,13 @@ async function currentPasswordProof(password: string): Promise<Record<string, st
   return { challenge_id: String(start.body.challenge_id), A: enc(proof.A), M1: enc(proof.M1) };
 }
 
-async function registerAccount(username: string, displayName: string, password: string): Promise<void> {
+async function registerAccount(username: string, displayName: string, password: string, email: string): Promise<void> {
   const salt = generateSalt();
   const verifier = await computeVerifier(password, salt, DEFAULT_SRP_KDF);
   const response = await post('/api/auth/register', {
     username,
     display_name: displayName,
+    ...(email ? { email } : {}),
     srp_salt: enc(salt),
     srp_verifier: enc(verifier),
     srp_group: '2048',
@@ -237,6 +238,7 @@ async function start(): Promise<void> {
     showError('');
     const username = byId<HTMLInputElement>('register-username').value.trim();
     const displayName = byId<HTMLInputElement>('register-display').value.trim();
+    const email = byId<HTMLInputElement>('register-email').value.trim();
     const password = byId<HTMLInputElement>('register-password').value;
     const confirmation = byId<HTMLInputElement>('register-confirm').value;
     if (password !== confirmation) {
@@ -245,7 +247,7 @@ async function start(): Promise<void> {
     }
     setBusy(registerForm, true, 'Creating account…', 'Create account');
     try {
-      await registerAccount(username, displayName, password);
+      await registerAccount(username, displayName, password, email);
       pending = { username, password };
       const code = randomCode();
       byId('recovery-code').textContent = code;

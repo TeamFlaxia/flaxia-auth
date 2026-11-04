@@ -17,7 +17,8 @@ Flaxia /login
        └─ 302 -> auth.flaxia.app/login?code_challenge=...&state=...&return_uri=...
 
 auth.flaxia.app /login
-  ├─ ユーザー名 + パスワードで SRP-6a ログイン（旧方式・リカバリも同じ画面）
+  ├─ ユーザー名またはメールアドレス + パスワードで SRP-6a ログイン
+  │  （旧方式・リカバリも同じ画面）
   ├─ POST /api/auth/flaxia/authorize { challenge }
   └─ 302 -> return_uri?code=...&state=...
 

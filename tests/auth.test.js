@@ -90,7 +90,7 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal((await request('/api/auth/register', { body: registration, origin: 'https://evil.example' })).status, 403);
   assert.equal((await request('/api/auth/register', { body: registration, origin: '' })).status, 403);
   assert.equal((await request('/api/auth/register', { body: { ...registration, srp_kdf: 'sha256-v1' } })).status, 400);
-  const registered = await request('/api/auth/register', { body: { ...registration, display_name: 'Test User' } });
+  const registered = await request('/api/auth/register', { body: { ...registration, display_name: 'Test User', email: 'TestUser@Example.com' } });
   assert.equal(registered.status, 201);
   assert.equal(registered.headers.get('access-control-allow-origin'), 'https://flaxia.app');
   assert.equal(registered.headers.get('access-control-allow-credentials'), 'true');
@@ -106,6 +106,11 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal(start.status, 200);
   const challenge = await start.json();
   assert.equal(challenge.srp_kdf, 'pbkdf2-600k-v2');
+  for (const body of [{ username: 'testuser@example.com' }, { email: 'testuser@example.com' }]) {
+    const byEmail = await request('/api/auth/login/start', { body, ip: '192.0.2.11' });
+    assert.equal(byEmail.status, 200, await byEmail.clone().text());
+    assert.equal((await byEmail.json()).srp, true);
+  }
   const first = await clientStep1(password, decode(challenge.salt));
   const proof = await clientStep2(password, decode(challenge.salt), first.a, decode(challenge.B));
   const body = { challenge_id: challenge.challenge_id, A: encode(proof.A), M1: encode(proof.M1) };

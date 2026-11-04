@@ -37,11 +37,11 @@ Base URL: `https://auth.flaxia.app`
 }
 ```
 
-`username` は半角英数字と `_` の1〜20文字で、大文字と小文字を区別せずに一意です。`display_name` は省略でき、指定する場合は1〜50文字です。成功時はHTTP 201で `{ "user": { "id", "username", "display_name" } }` を返し、セッションCookieを発行します。重複時は409です。
+`username` は半角英数字と `_` の1〜20文字で、大文字と小文字を区別せずに一意です。`display_name` は省略でき、指定する場合は1〜50文字です。`email` は任意で、指定するとログインの識別子としても使えます。成功時はHTTP 201で `{ "user": { "id", "username", "display_name" } }` を返し、セッションCookieを発行します。重複時は409です。
 
 ## ログイン
 
-1. `POST /api/auth/login/start` に `{ "username": "example_user" }` を送ります。成功時は `challenge_id`、`salt`、`B`、`srp_kdf` と `srp: true` を返します。
+1. `POST /api/auth/login/start` に `{ "username": "example_user" }` を送ります。`username` の代わりに `{ "email": "user@example.com" }` も使えます。成功時は `challenge_id`、`salt`、`B`、`srp_kdf` と `srp: true` を返します。
 2. クライアントは指定されたKDFで `A` と `M1` を計算し、`POST /api/auth/login/verify` に `{ "challenge_id", "A", "M1" }` を送ります。
 3. 成功時は `{ "user", "M2" }` とセッションCookieを返します。クライアントは `M2` を検証してください。
 

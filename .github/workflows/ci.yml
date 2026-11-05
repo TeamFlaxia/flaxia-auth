@@ -20,6 +20,7 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
+      - run: npm run build
       - run: npm run typecheck
       - run: npm test
 
@@ -38,6 +39,7 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
+      - run: npm run build
       - name: Apply D1 migrations
         if: hashFiles('migrations/*.sql') != ''
         run: npx wrangler d1 migrations apply flaxia-auth-prod --remote

@@ -58,6 +58,29 @@ async function sessionUser(db: D1Database, token: string | undefined): Promise<U
   return db.prepare('SELECT u.* FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.id = ? AND s.expires_at > ? AND u.frozen_at IS NULL').bind(token, new Date().toISOString()).first<User>();
 }
 
+// Username-first accounts still accept an email whenever Auth holds one. The
+// identifier is never treated as trusted input beyond a bounded lookup key.
+function loginIdentifier(body: { username?: unknown; email?: unknown }): string | null {
+  const value = typeof body.username === 'string' ? body.username : typeof body.email === 'string' ? body.email : null;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length === 0 || trimmed.length > 254 ? null : trimmed;
+}
+
+function userByIdentifier(db: D1Database, identifier: string): Promise<User | null> {
+  return db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE OR (email IS NOT NULL AND email = ? COLLATE NOCASE)').bind(identifier, identifier).first<User>();
+}
+
+// Flaxia may hand us its profile email during migration. Only a plausible,
+// non-placeholder address is stored; a conflicting address is ignored so the
+// account still migrates and email login stays unavailable for that account.
+function syncedEmail(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const email = value.trim().toLowerCase();
+  if (email.length === 0 || email.length > 254 || email.endsWith('.invalid')) return null;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+}
+
 async function verifyProof(db: D1Database, user: User, input: unknown, purpose: 'session-reauth' | 'grant-reauth', binding: string): Promise<boolean> {
   if (!input || typeof input !== 'object') return false;
   const proof = input as SrpProof;
@@ -70,6 +93,14 @@ async function verifyProof(db: D1Database, user: User, input: unknown, purpose: 
   } catch { return false; }
 }
 app.get('/health', c => c.json({ service: 'flaxia-auth', status: 'ok' }));
+
+// The login UI lives on the Auth origin. `/register` is the same document; the
+// client selects the registration tab from the path.
+const loginPage = (c: { env: Env; req: { url: string } }) =>
+  c.env.ASSETS.fetch(new URL('/login.html', c.req.url));
+app.get('/', loginPage);
+app.get('/login', loginPage);
+app.get('/register', loginPage);
 
 async function credentialStamp(db: D1Database, userId: string): Promise<string | null> {
   const user = await db.prepare('SELECT srp_salt, srp_verifier, srp_group, srp_kdf FROM users WHERE id = ? AND frozen_at IS NULL').bind(userId).first<User>();
@@ -130,10 +161,12 @@ bridge.post('/api/flaxia/provision', bodyLimit({ maxSize: 2048 }), async c => {
       typeof display !== 'string' || display.length < 1 || display.length > 50 ||
       typeof salt !== 'string' || typeof verifier !== 'string' || salt.length > 32 || verifier.length > 400 ||
       group !== '2048' || !isCreatableSrpKdf(kdf) || !validCredentials(salt, verifier)) return c.json({ error: 'Invalid request' }, 400);
+  const email = syncedEmail(body.email);
   await c.env.DB.batch([
     c.env.DB.prepare('INSERT OR IGNORE INTO users (id, username, display_name, srp_salt, srp_verifier, srp_group, srp_kdf) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(id, username, display, salt, verifier, group, kdf),
     c.env.DB.prepare(`INSERT OR IGNORE INTO flaxia_credential_guards (user_id)
       SELECT id FROM users WHERE id = ? AND username = ? COLLATE BINARY AND display_name = ? AND srp_salt = ? AND srp_verifier = ? AND srp_group = ? AND srp_kdf = ? AND frozen_at IS NULL`).bind(id, username, display, salt, verifier, group, kdf),
+    c.env.DB.prepare('UPDATE OR IGNORE users SET email = ? WHERE id = ? AND email IS NULL').bind(email, id),
   ]);
   const matches = await c.env.DB.prepare(`SELECT 1 AS ok FROM users u JOIN flaxia_credential_guards g ON g.user_id = u.id
     WHERE u.id = ? AND u.username = ? COLLATE BINARY AND u.display_name = ? AND u.srp_salt = ? AND u.srp_verifier = ? AND u.srp_group = ? AND u.srp_kdf = ? AND u.frozen_at IS NULL`).bind(id, username, display, salt, verifier, group, kdf).first();
@@ -189,12 +222,14 @@ bridge.post('/api/flaxia/introspect', bodyLimit({ maxSize: 512 }), async c => {
 
 // Once the consumer durably links the Auth ID, its legacy credential
 // fingerprint is no longer needed and is removed immediately.
-bridge.post('/api/flaxia/link-complete', bodyLimit({ maxSize: 512 }), async c => {
+bridge.post('/api/flaxia/link-complete', bodyLimit({ maxSize: 1024 }), async c => {
   c.header('Cache-Control', 'no-store');
-  let body: { grant?: unknown; user_id?: unknown };
+  let body: { grant?: unknown; user_id?: unknown; email?: unknown };
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
   const user = await userForGrant(c.env.DB, body?.grant);
   if (!user || user.id !== body?.user_id) return c.json({ error: 'Invalid authorization' }, 401);
+  const email = syncedEmail(body.email);
+  if (email) await c.env.DB.prepare('UPDATE OR IGNORE users SET email = ? WHERE id = ? AND email IS NULL').bind(email, user.id).run();
   await c.env.DB.prepare('DELETE FROM flaxia_legacy_fingerprints WHERE user_id = ?').bind(user.id).run();
   return c.json({ success: true });
 });
@@ -753,11 +788,12 @@ app.post('/api/auth/register', async c => {
 // rejects PBKDF2 iteration counts above 100,000, so the 600k v2 KDF cannot be
 // derived server-side.
 app.post('/api/auth/login/legacy', async c => {
-  let body: { username?: unknown; password?: unknown; srp_salt?: unknown; srp_verifier?: unknown; srp_group?: unknown; srp_kdf?: unknown };
+  let body: { username?: unknown; email?: unknown; password?: unknown; srp_salt?: unknown; srp_verifier?: unknown; srp_group?: unknown; srp_kdf?: unknown };
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
-  if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.username !== 'string' || !/^[a-zA-Z0-9_]{1,20}$/.test(body.username) || typeof body.password !== 'string' || body.password.length === 0 || body.password.length > 1024) return c.json({ error: 'Invalid request' }, 400);
-  if (await rateLimit(c.env.DB, `legacy-login:user:${body.username.toLowerCase()}`, 5)) return c.json({ error: 'Too many requests' }, 429);
-  const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').bind(body.username).first<User>();
+  const identifier = loginIdentifier(body);
+  if (!body || typeof body !== 'object' || Array.isArray(body) || !identifier || typeof body.password !== 'string' || body.password.length === 0 || body.password.length > 1024) return c.json({ error: 'Invalid request' }, 400);
+  if (await rateLimit(c.env.DB, `legacy-login:user:${identifier.toLowerCase()}`, 5)) return c.json({ error: 'Too many requests' }, 429);
+  const user = await userByIdentifier(c.env.DB, identifier);
   if (!user || user.srp_salt !== null || user.srp_verifier !== null || !user.password_hash || !await verifyLegacyPassword(body.password, user.password_hash)) return c.json({ error: 'Invalid credentials' }, 401);
   if (user.frozen_at) return c.json({ error: 'account_frozen', username: user.username }, 403);
   const { srp_salt: saltEncoded, srp_verifier: verifierEncoded, srp_group: group, srp_kdf: kdf } = body;
@@ -778,11 +814,15 @@ app.post('/api/auth/login/legacy', async c => {
 
 app.post('/api/auth/recovery/start', async c => {
   if (await rateLimit(c.env.DB, `recovery-login:ip:${requestIp(c)}`, 10)) return c.json({ error: 'Too many requests' }, 429);
-  let body: { username?: unknown };
+  let body: { username?: unknown; email?: unknown };
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
-  if (!body || typeof body.username !== 'string' || !/^[a-zA-Z0-9_]{1,20}$/.test(body.username)) return c.json({ error: 'Invalid request' }, 400);
-  if (await rateLimit(c.env.DB, `recovery-login:user:${body.username.toLowerCase()}`, 5)) return c.json({ error: 'Too many requests' }, 429);
-  const user = await c.env.DB.prepare('SELECT u.id, f.srp_salt, f.srp_verifier, f.srp_kdf FROM users u JOIN auth_recovery_factors f ON f.user_id = u.id WHERE u.username = ? COLLATE NOCASE AND u.frozen_at IS NULL').bind(body.username).first<{ id: string; srp_salt: string; srp_verifier: string; srp_kdf: string }>();
+  const identifier = body && typeof body === 'object' && !Array.isArray(body) ? loginIdentifier(body) : null;
+  if (!identifier) return c.json({ error: 'Invalid request' }, 400);
+  if (await rateLimit(c.env.DB, `recovery-login:user:${identifier.toLowerCase()}`, 5)) return c.json({ error: 'Too many requests' }, 429);
+  const account = await userByIdentifier(c.env.DB, identifier);
+  const user = account && !account.frozen_at
+    ? await c.env.DB.prepare('SELECT srp_salt, srp_verifier, srp_kdf FROM auth_recovery_factors WHERE user_id = ?').bind(account.id).first<{ srp_salt: string; srp_verifier: string; srp_kdf: string }>()
+    : null;
   // Do not expose whether the username exists or has a recovery factor.
   const dummyVerifier = new Uint8Array(256); dummyVerifier[255] = 2;
   const usable = user && isSupportedSrpKdf(user.srp_kdf) ? user : null;
@@ -791,7 +831,7 @@ app.post('/api/auth/recovery/start', async c => {
   const { B, b } = await serverStep1(salt, verifier);
   const challenge = random();
   await c.env.DB.prepare('DELETE FROM srp_handshakes WHERE expires_at <= ?').bind(new Date().toISOString()).run();
-  if (usable) await c.env.DB.prepare("INSERT INTO srp_handshakes (id, user_id, b_scalar, b_pub, expires_at, purpose) VALUES (?, ?, ?, ?, ?, 'recovery-login')").bind(challenge, usable.id, b.toString(), enc(B), expiry(300000)).run();
+  if (usable) await c.env.DB.prepare("INSERT INTO srp_handshakes (id, user_id, b_scalar, b_pub, expires_at, purpose) VALUES (?, ?, ?, ?, ?, 'recovery-login')").bind(challenge, account?.id, b.toString(), enc(B), expiry(300000)).run();
   return c.json({ challenge_id: challenge, salt: enc(salt), B: enc(B), srp_kdf: usable?.srp_kdf ?? 'pbkdf2-600k-v2' });
 });
 
@@ -821,13 +861,36 @@ app.post('/api/auth/recovery/verify', async c => {
   } catch { return c.json({ error: 'Recovery unavailable' }, 401); }
 });
 
+// Enroll or replace the recovery factor from the login UI. The current
+// password is proven with a session-bound SRP handshake, exactly like the
+// service-binding path Flaxia uses after sign-in.
+app.post('/api/auth/recovery/enroll', async c => {
+  const session = getCookie(c, cookieName);
+  const user = await sessionUser(c.env.DB, session);
+  if (!user || !session) return c.json({ error: 'Unauthenticated' }, 401);
+  if (await rateLimit(c.env.DB, `recovery-enroll:user:${user.id}`, 10)) return c.json({ error: 'Too many requests' }, 429);
+  let body: { salt?: unknown; verifier?: unknown; kdf?: unknown; current_srp?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (typeof body.salt !== 'string' || typeof body.verifier !== 'string' || !isCreatableSrpKdf(body.kdf) || !validCredentials(body.salt, body.verifier)) return c.json({ error: 'Invalid recovery verifier' }, 400);
+  if (!await verifyProof(c.env.DB, user, body.current_srp, 'session-reauth', session)) return c.json({ error: 'Current password is incorrect' }, 401);
+  const result = await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO auth_recovery_factors (user_id, srp_salt, srp_verifier, srp_kdf)
+      SELECT id, ?, ?, ? FROM users WHERE id = ? AND frozen_at IS NULL AND srp_salt IS ? AND srp_verifier IS ?
+      ON CONFLICT(user_id) DO UPDATE SET srp_salt = excluded.srp_salt, srp_verifier = excluded.srp_verifier, srp_kdf = excluded.srp_kdf`)
+      .bind(body.salt, body.verifier, body.kdf, user.id, user.srp_salt, user.srp_verifier),
+    c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND id != ? AND changes() = 1').bind(user.id, session),
+    c.env.DB.prepare("DELETE FROM srp_handshakes WHERE user_id = ? AND purpose IN ('recovery-login', 'grant-recovery') AND EXISTS (SELECT 1 FROM auth_recovery_factors WHERE user_id = ? AND srp_salt = ? AND srp_verifier = ?)").bind(user.id, user.id, body.salt, body.verifier),
+  ]);
+  return result[0].meta.changes === 1 ? c.json({ success: true }) : c.json({ error: 'Credentials or session changed' }, 409);
+});
+
 app.post('/api/auth/login/start', async c => {
-  let body: { username?: unknown };
+  let body: { username?: unknown; email?: unknown };
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'Invalid request' }, 400);
-  const byUsername = typeof body.username === 'string' && /^[a-zA-Z0-9_]{1,20}$/.test(body.username);
-  if (!byUsername) return c.json({ error: 'Invalid credentials' }, 400);
-  const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').bind(body.username).first<User>();
+  const identifier = loginIdentifier(body);
+  if (!identifier) return c.json({ error: 'Invalid credentials' }, 400);
+  const user = await userByIdentifier(c.env.DB, identifier);
   if (user && user.srp_salt === null && user.srp_verifier === null && user.password_hash) return c.json({ srp: false });
   if (!user?.srp_salt || !user.srp_verifier || !isSupportedSrpKdf(user.srp_kdf ?? 'sha256-v1')) return c.json({ error: 'Invalid credentials' }, 401);
   if (await rateLimit(c.env.DB, `login-start:user:${user.id}`, 5)) return c.json({ error: 'Too many requests' }, 429);

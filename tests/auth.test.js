@@ -213,6 +213,9 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   const authCookie = convertedLogin.headers.get('set-cookie').split(';')[0];
   const pkceVerifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
   const pkceChallenge = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pkceVerifier))).toString('base64url');
+  assert.equal((await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: pkceChallenge }, origin: 'https://evil.example', ip: '192.0.2.13' })).status, 403);
+  const authOriginAuthorize = await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: pkceChallenge }, origin: 'https://auth.flaxia.app', ip: '192.0.2.13' });
+  assert.equal(authOriginAuthorize.status, 200);
   const authorize = await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: pkceChallenge }, ip: '192.0.2.13' });
   assert.equal(authorize.status, 200);
   const { code } = await authorize.json();

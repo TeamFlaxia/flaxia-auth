@@ -933,7 +933,9 @@ app.get('/api/auth/me', async c => {
 });
 
 app.post('/api/auth/flaxia/authorize', async c => {
-  if (c.req.header('Origin') !== 'https://flaxia.app') return c.json({ error: 'Invalid origin' }, 403);
+  // The login UI is served from auth.flaxia.app and posts same-origin;
+  // legacy/embedded clients post from flaxia.app. Both are allowlisted.
+  if (!originAllowed(c.req.header('Origin'))) return c.json({ error: 'Invalid origin' }, 403);
   const session = getCookie(c, cookieName);
   const user = await sessionUser(c.env.DB, session);
   if (!user || !session) return c.json({ error: 'Unauthenticated' }, 401);

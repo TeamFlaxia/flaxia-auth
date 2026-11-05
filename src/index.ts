@@ -5,6 +5,7 @@ import { cors } from 'hono/cors';
 import { bodyLimit } from 'hono/body-limit';
 import { isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, serverStep2 } from './srp';
 import { originAllowed } from './origin';
+import { handleVaultRequest, importVault, validateVaultRewrap } from './vault';
 
 const app = new Hono<{ Bindings: Env }>();
 const bridge = new Hono<{ Bindings: Env }>();
@@ -25,6 +26,7 @@ const cookieOptions = { httpOnly: true, secure: true, sameSite: 'Lax' as const, 
 type User = { id: string; username: string; display_name: string; password_hash: string; srp_salt: string | null; srp_verifier: string | null; srp_group: string | null; srp_kdf: string | null; frozen_at: string | null };
 type Handshake = { user_id: string; b_scalar: string; b_pub: string };
 type SrpProof = { challenge_id?: unknown; A?: unknown; M1?: unknown };
+type VaultRewrap = { salt: string; kdf_params: unknown; wrapped_vk: string; vk_version: number };
 
 async function rateLimit(db: D1Database, key: string, limit: number): Promise<boolean> {
   const now = Math.floor(Date.now() / 1000);
@@ -217,7 +219,7 @@ bridge.post('/api/flaxia/revoke-user', bodyLimit({ maxSize: 512 }), async c => {
   return c.json({ success: true });
 });
 
-bridge.post('/api/flaxia/credentials/prepare', bodyLimit({ maxSize: 4096 }), async c => {
+bridge.post('/api/flaxia/credentials/prepare', bodyLimit({ maxSize: 8192 }), async c => {
   c.header('Cache-Control', 'no-store');
   let body: Record<string, unknown>;
   try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
@@ -230,6 +232,13 @@ bridge.post('/api/flaxia/credentials/prepare', bodyLimit({ maxSize: 4096 }), asy
   if (prior) return prior.state !== 'cancelled' && prior.user_id === userId && prior.grant_hash === grantHash && prior.target_stamp === target ? c.json({ success: true, target_stamp: target }) : c.json({ error: 'Operation conflict' }, 409);
   const user = await userForGrant(c.env.DB, grant);
   if (!user || user.id !== userId || !user.srp_verifier || !user.srp_salt) return c.json({ error: 'Invalid authorization' }, 401);
+
+  // Auth applies the encrypted Vault rewrap when the credential commits. The
+  // value is opaque; only its envelope shape and vk_version are checked here.
+  const rewrapError = await validateVaultRewrap(c.env.DB, user.id, body.vault_kek);
+  if (rewrapError) return c.json({ error: rewrapError.error }, rewrapError.status as 200);
+  const vaultJson = body.vault_kek === undefined ? null : JSON.stringify(body.vault_kek);
+
   const proof = body.current_srp as SrpProof | null;
   if (!proof || typeof proof.challenge_id !== 'string' || proof.challenge_id.length > 64 || typeof proof.A !== 'string' || proof.A.length > 400 || typeof proof.M1 !== 'string' || proof.M1.length > 64) return c.json({ error: 'Invalid proof' }, 400);
   const now = new Date().toISOString();
@@ -246,12 +255,12 @@ bridge.post('/api/flaxia/credentials/prepare', bodyLimit({ maxSize: 4096 }), asy
   try {
     const result = await c.env.DB.batch([
       c.env.DB.prepare('DELETE FROM srp_handshakes WHERE id = ? AND user_id = ? AND purpose = ? AND binding_hash = ? AND expires_at > ?').bind(proof.challenge_id, user.id, purpose, grantHash, now),
-      c.env.DB.prepare(`INSERT INTO flaxia_credential_changes (operation_hash, user_id, grant_hash, expected_salt, expected_verifier, new_salt, new_verifier, new_group, new_kdf, target_stamp, state, recovery_token)
-        SELECT ?, u.id, ?, u.srp_salt, u.srp_verifier, ?, ?, ?, ?, ?, 'prepared', ? FROM users u
+      c.env.DB.prepare(`INSERT INTO flaxia_credential_changes (operation_hash, user_id, grant_hash, expected_salt, expected_verifier, new_salt, new_verifier, new_group, new_kdf, target_stamp, state, recovery_token, vault_json)
+        SELECT ?, u.id, ?, u.srp_salt, u.srp_verifier, ?, ?, ?, ?, ?, 'prepared', ?, ? FROM users u
         JOIN flaxia_session_grants g ON g.user_id = u.id JOIN sessions s ON s.id = g.session_id AND s.user_id = u.id
         WHERE changes() = 1 AND u.id = ? AND u.frozen_at IS NULL AND u.srp_salt = ? AND u.srp_verifier = ? AND g.token_hash = ? AND s.expires_at > ?
           AND (? = 0 OR EXISTS (SELECT 1 FROM auth_recovery_factors f WHERE f.user_id = u.id AND f.srp_salt = ? AND f.srp_verifier = ?))`)
-        .bind(operationHash, grantHash, salt, verifier, group, kdf, target, body.recoverable === true ? operation : null, user.id, user.srp_salt, user.srp_verifier, grantHash, now, recovery ? 1 : 0, factor?.srp_salt ?? null, factor?.srp_verifier ?? null),
+        .bind(operationHash, grantHash, salt, verifier, group, kdf, target, body.recoverable === true ? operation : null, vaultJson, user.id, user.srp_salt, user.srp_verifier, grantHash, now, recovery ? 1 : 0, factor?.srp_salt ?? null, factor?.srp_verifier ?? null),
     ]);
     if (result[0].meta.changes !== 1 || result[1].meta.changes !== 1) return c.json({ error: 'Credentials or session changed' }, 409);
     return c.json({ success: true, target_stamp: target });
@@ -266,18 +275,54 @@ bridge.post('/api/flaxia/credentials/commit', bodyLimit({ maxSize: 512 }), async
   const operationHash = await sha256url(body.operation), grantHash = await sha256url(body.grant);
   const caller = await userForGrant(c.env.DB, body.grant);
   if (!caller || caller.id !== body.user_id) return c.json({ error: 'Invalid authorization' }, 401);
-  const job = await c.env.DB.prepare('SELECT * FROM flaxia_credential_changes WHERE operation_hash = ? AND user_id = ?').bind(operationHash, body.user_id).first<{ user_id: string; grant_hash: string; state: string; expected_salt: string | null; expected_verifier: string | null; new_salt: string | null; new_verifier: string | null; new_group: string | null; new_kdf: string | null; target_stamp: string }>();
+  const job = await c.env.DB.prepare('SELECT * FROM flaxia_credential_changes WHERE operation_hash = ? AND user_id = ?').bind(operationHash, body.user_id).first<{ user_id: string; grant_hash: string; state: string; expected_salt: string | null; expected_verifier: string | null; new_salt: string | null; new_verifier: string | null; new_group: string | null; new_kdf: string | null; target_stamp: string; vault_json: string | null }>();
   if (!job) return c.json({ error: 'Operation not found' }, 404);
   if (job.grant_hash !== grantHash) return c.json({ error: 'Invalid authorization' }, 401);
   if (job.state === 'committed') return c.json({ success: true, target_stamp: job.target_stamp });
-  const result = await c.env.DB.batch([
-    c.env.DB.prepare("UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ? WHERE id = ? AND frozen_at IS NULL AND srp_salt = ? AND srp_verifier = ? AND EXISTS (SELECT 1 FROM flaxia_credential_changes WHERE operation_hash = ? AND state = 'prepared' AND target_stamp = ? AND grant_hash = ?) AND EXISTS (SELECT 1 FROM flaxia_session_grants g JOIN sessions s ON s.id = g.session_id AND s.user_id = g.user_id WHERE g.token_hash = ? AND g.user_id = users.id AND s.expires_at > ?)")
-      .bind(job.new_salt, job.new_verifier, job.new_group, job.new_kdf, '', job.user_id, job.expected_salt, job.expected_verifier, operationHash, job.target_stamp, grantHash, grantHash, new Date().toISOString()),
-    c.env.DB.prepare("UPDATE flaxia_credential_changes SET state = 'committed', expected_salt = NULL, expected_verifier = NULL, new_salt = NULL, new_verifier = NULL, new_group = NULL, new_kdf = NULL WHERE operation_hash = ? AND state = 'prepared' AND changes() = 1").bind(operationHash),
+
+  let vault: VaultRewrap | null = null;
+  if (job.vault_json) {
+    try { vault = JSON.parse(job.vault_json) as VaultRewrap; } catch { vault = null; }
+    const rewrapError = await validateVaultRewrap(c.env.DB, job.user_id, vault);
+    if (rewrapError) return c.json({ error: rewrapError.error }, rewrapError.status as 200);
+  }
+
+  const now = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    c.env.DB.prepare(`UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ?
+      WHERE id = ? AND frozen_at IS NULL AND srp_salt = ? AND srp_verifier = ?
+        AND EXISTS (SELECT 1 FROM flaxia_credential_changes WHERE operation_hash = ? AND state = 'prepared' AND target_stamp = ? AND grant_hash = ?)
+        AND EXISTS (SELECT 1 FROM flaxia_session_grants g JOIN sessions s ON s.id = g.session_id AND s.user_id = g.user_id WHERE g.token_hash = ? AND g.user_id = users.id AND s.expires_at > ?)
+        AND (? = 0 OR EXISTS (SELECT 1 FROM vault_keys WHERE user_id = users.id AND vk_version = ?))`)
+      .bind(job.new_salt, job.new_verifier, job.new_group, job.new_kdf, '', job.user_id, job.expected_salt, job.expected_verifier, operationHash, job.target_stamp, grantHash, grantHash, now, vault ? 1 : 0, vault?.vk_version ?? 0),
+  ];
+  if (vault) {
+    const version = vault.vk_version;
+    statements.push(
+      c.env.DB.prepare(`UPDATE vault_keys SET salt = ?, kdf_params = ?, wrapped_vk = ?,
+        vk_version = vk_version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE user_id = ? AND vk_version = ?
+          AND EXISTS (SELECT 1 FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?)`)
+        .bind(vault.salt, JSON.stringify(vault.kdf_params), vault.wrapped_vk, job.user_id, version, job.user_id, job.new_salt, job.new_verifier),
+      c.env.DB.prepare(`UPDATE vault_items SET vk_version = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE user_id = ? AND vk_version = ?
+          AND EXISTS (SELECT 1 FROM vault_keys WHERE user_id = ? AND vk_version = ?)`)
+        .bind(version + 1, job.user_id, version, job.user_id, version + 1),
+    );
+  }
+  statements.push(
+    c.env.DB.prepare(`UPDATE flaxia_credential_changes SET state = 'committed', expected_salt = NULL, expected_verifier = NULL, new_salt = NULL, new_verifier = NULL, new_group = NULL, new_kdf = NULL, vault_json = NULL
+      WHERE operation_hash = ? AND state = 'prepared'
+        AND EXISTS (SELECT 1 FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?)
+        AND (? = 0 OR EXISTS (SELECT 1 FROM vault_keys WHERE user_id = ? AND vk_version = ?))`)
+      .bind(operationHash, job.user_id, job.new_salt, job.new_verifier, vault ? 1 : 0, job.user_id, (vault?.vk_version ?? 0) + 1),
     c.env.DB.prepare("DELETE FROM flaxia_legacy_fingerprints WHERE user_id = ? AND EXISTS (SELECT 1 FROM flaxia_credential_changes WHERE operation_hash = ? AND state = 'committed')").bind(job.user_id, operationHash),
     c.env.DB.prepare("DELETE FROM sessions WHERE user_id = ? AND id != COALESCE((SELECT session_id FROM flaxia_session_grants WHERE token_hash = ?), '') AND EXISTS (SELECT 1 FROM flaxia_credential_changes WHERE operation_hash = ? AND state = 'committed')").bind(job.user_id, grantHash, operationHash),
-  ]);
-  if (result[1].meta.changes !== 1) return c.json({ error: 'Credentials changed' }, 409);
+  );
+  const result = await c.env.DB.batch(statements);
+  if (!result[0].meta.changes || (vault && !result[1].meta.changes) || result[vault ? 3 : 1].meta.changes !== 1) {
+    return c.json({ error: 'Credentials changed' }, 409);
+  }
   return c.json({ success: true, target_stamp: job.target_stamp });
 });
 
@@ -327,7 +372,7 @@ bridge.post('/api/flaxia/credentials/cancel', bodyLimit({ maxSize: 512 }), async
   if (!caller || caller.id !== body.user_id) return c.json({ error: 'Invalid authorization' }, 401);
   await c.env.DB.batch([
     c.env.DB.prepare("INSERT OR IGNORE INTO flaxia_credential_changes (operation_hash, user_id, grant_hash, target_stamp, state) SELECT ?, id, ?, '', 'cancelled' FROM users WHERE id = ?").bind(operationHash, grantHash, body.user_id),
-    c.env.DB.prepare("UPDATE flaxia_credential_changes SET state = 'cancelled', recovery_token = NULL, expected_salt = NULL, expected_verifier = NULL, new_salt = NULL, new_verifier = NULL, new_group = NULL, new_kdf = NULL WHERE operation_hash = ? AND user_id = ? AND state = 'prepared'").bind(operationHash, body.user_id),
+    c.env.DB.prepare("UPDATE flaxia_credential_changes SET state = 'cancelled', recovery_token = NULL, expected_salt = NULL, expected_verifier = NULL, new_salt = NULL, new_verifier = NULL, new_group = NULL, new_kdf = NULL, vault_json = NULL WHERE operation_hash = ? AND user_id = ? AND state = 'prepared'").bind(operationHash, body.user_id),
   ]);
   const remaining = await c.env.DB.prepare('SELECT state, grant_hash, user_id FROM flaxia_credential_changes WHERE operation_hash = ?').bind(operationHash).first<{ state: string; grant_hash: string; user_id: string }>();
   return remaining?.state === 'cancelled' && remaining.user_id === body.user_id ? c.json({ success: true }) : c.json({ error: 'Operation cannot be cancelled' }, 409);
@@ -345,7 +390,7 @@ bridge.post('/api/flaxia/credentials/cancel-hash', bodyLimit({ maxSize: 512 }), 
   const grantHash = await sha256url(body.grant);
   await c.env.DB.batch([
     c.env.DB.prepare("INSERT OR IGNORE INTO flaxia_credential_changes (operation_hash, user_id, grant_hash, target_stamp, state) VALUES (?, ?, ?, '', 'cancelled')").bind(body.operation_hash, user.id, grantHash),
-    c.env.DB.prepare("UPDATE flaxia_credential_changes SET state = 'cancelled', recovery_token = NULL, expected_salt = NULL, expected_verifier = NULL, new_salt = NULL, new_verifier = NULL, new_group = NULL, new_kdf = NULL WHERE operation_hash = ? AND user_id = ? AND state = 'prepared'").bind(body.operation_hash, user.id),
+    c.env.DB.prepare("UPDATE flaxia_credential_changes SET state = 'cancelled', recovery_token = NULL, expected_salt = NULL, expected_verifier = NULL, new_salt = NULL, new_verifier = NULL, new_group = NULL, new_kdf = NULL, vault_json = NULL WHERE operation_hash = ? AND user_id = ? AND state = 'prepared'").bind(body.operation_hash, user.id),
   ]);
   const job = await c.env.DB.prepare('SELECT state FROM flaxia_credential_changes WHERE operation_hash = ? AND user_id = ?').bind(body.operation_hash, user.id).first<{ state: string }>();
   return job?.state === 'cancelled' ? c.json({ success: true }) : c.json({ error: 'Operation cannot be cancelled' }, 409);
@@ -471,6 +516,89 @@ bridge.post('/api/flaxia/delete/status', bodyLimit({ maxSize: 512 }), async c =>
   return c.json({ deleted: !!receipt && receipt.user_hash === await sha256url(body.user_id) });
 });
 
+// Service-bound Vault access. Flaxia can proxy its existing /api/vault routes
+// here without copying wrapped keys or proving the password in its own DB. The
+// grant is the same bearer capability used for other service-bound operations,
+// and the SRP proof is bound to that grant.
+bridge.post('/api/flaxia/vault', bodyLimit({ maxSize: 300_000 }), async c => {
+  c.header('Cache-Control', 'no-store');
+  let body: {
+    grant?: unknown;
+    user_id?: unknown;
+    method?: unknown;
+    path?: unknown;
+    query?: unknown;
+    body?: unknown;
+  };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body) ||
+      typeof body.grant !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.grant) ||
+      typeof body.user_id !== 'string' || body.user_id.length < 1 || body.user_id.length > 128 ||
+      (body.method !== 'GET' && body.method !== 'POST' && body.method !== 'PUT' && body.method !== 'DELETE') ||
+      typeof body.path !== 'string' || body.path.length < 1 || body.path.length > 128 || !body.path.startsWith('/')) {
+    return c.json({ error: 'Invalid request' }, 400);
+  }
+  const user = await userForGrant(c.env.DB, body.grant);
+  if (!user || user.id !== body.user_id) return c.json({ error: 'Invalid authorization' }, 401);
+
+  let path = body.path;
+  let inlineQuery = '';
+  const queryIndex = path.indexOf('?');
+  if (queryIndex >= 0) {
+    inlineQuery = path.slice(queryIndex + 1);
+    path = path.slice(0, queryIndex);
+  }
+  if (path.startsWith('/api/vault')) path = path.slice('/api/vault'.length) || '/';
+  if (!path.startsWith('/') || path.length > 128) return c.json({ error: 'Invalid request' }, 400);
+
+  const query = new URLSearchParams(inlineQuery);
+  if (body.query !== undefined) {
+    if (!body.query || typeof body.query !== 'object' || Array.isArray(body.query)) {
+      return c.json({ error: 'Invalid request' }, 400);
+    }
+    const entries = Object.entries(body.query as Record<string, unknown>);
+    if (entries.length > 8) return c.json({ error: 'Invalid request' }, 400);
+    for (const [key, value] of entries) {
+      if (!/^[a-z_]{1,32}$/.test(key) || typeof value !== 'string' || value.length > 64) {
+        return c.json({ error: 'Invalid request' }, 400);
+      }
+      query.set(key, value);
+    }
+  }
+
+  const result = await handleVaultRequest({
+    db: c.env.DB,
+    userId: user.id,
+    method: body.method,
+    path,
+    query,
+    body: body.body,
+    verifyCurrentSrp: proof => verifyProof(c.env.DB, user, proof, 'grant-reauth', body.grant as string),
+  });
+  return c.json(result.body, result.status as 200);
+});
+
+// One-time copy of a Vault that Flaxia still holds in its own D1. The payload
+// is entirely client-wrapped ciphertext, so the grant is the only authority
+// needed. Import is idempotent and refuses to replace an existing envelope.
+bridge.post('/api/flaxia/vault/import', bodyLimit({ maxSize: 8_000_000 }), async c => {
+  c.header('Cache-Control', 'no-store');
+  let body: { grant?: unknown; user_id?: unknown; keys?: unknown; devices?: unknown; items?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body) ||
+      typeof body.grant !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.grant) ||
+      typeof body.user_id !== 'string' || body.user_id.length < 1 || body.user_id.length > 128) {
+    return c.json({ error: 'Invalid request' }, 400);
+  }
+  const user = await userForGrant(c.env.DB, body.grant);
+  if (!user || user.id !== body.user_id) return c.json({ error: 'Invalid authorization' }, 401);
+  if (await rateLimit(c.env.DB, `flaxia-vault-import:user:${user.id}`, 20)) {
+    return c.json({ error: 'Too many requests' }, 429);
+  }
+  const result = await importVault(c.env.DB, user.id, { keys: body.keys, devices: body.devices, items: body.items });
+  return c.json(result.body, result.status as 200);
+});
+
 bridge.post('/api/flaxia/reauth/start', bodyLimit({ maxSize: 512 }), async c => {
   c.header('Cache-Control', 'no-store');
   let body: { grant?: unknown; user_id?: unknown };
@@ -556,6 +684,44 @@ app.use('/api/auth/*', async (c, next) => {
   if (!ip) return c.json({ error: 'Authentication unavailable' }, 503);
   if (await rateLimit(c.env.DB, `${c.req.path}:ip:${ip}`, 20)) return c.json({ error: 'Too many requests' }, 429);
   await next();
+});
+
+// Vault requests carry up to 128 KB of opaque ciphertext per item, so they use
+// a larger body limit than the credential API. Reads and writes share the same
+// Origin and IP protections as authentication.
+app.use('/api/vault/*', cors({ origin: origin => originAllowed(origin) ? origin : '', credentials: true, allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], allowHeaders: ['Content-Type'] }));
+app.use('/api/vault/*', bodyLimit({ maxSize: 300_000, onError: c => c.json({ error: 'Request too large' }, 413) }));
+app.use('/api/vault/*', async (c, next) => {
+  c.header('Cache-Control', 'no-store');
+  if (c.req.method !== 'GET' && !originAllowed(c.req.header('Origin'))) return c.json({ error: 'Invalid origin' }, 403);
+  const ip = c.req.header('CF-Connecting-IP');
+  if (!ip) return c.json({ error: 'Authentication unavailable' }, 503);
+  // Device polling is frequent; keep a ceiling without breaking pairing UX.
+  if (await rateLimit(c.env.DB, `${c.req.path}:ip:${ip}`, 120)) return c.json({ error: 'Too many requests' }, 429);
+  await next();
+});
+
+app.all('/api/vault/*', async c => {
+  const session = getCookie(c, cookieName);
+  const user = await sessionUser(c.env.DB, session);
+  if (!user || !session) return c.json({ error: 'Unauthenticated' }, 401);
+
+  let body: unknown;
+  if (c.req.method !== 'GET' && (c.req.header('Content-Type') ?? '').includes('application/json')) {
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  }
+  const url = new URL(c.req.url);
+  const path = url.pathname.slice('/api/vault'.length) || '/';
+  const result = await handleVaultRequest({
+    db: c.env.DB,
+    userId: user.id,
+    method: c.req.method,
+    path,
+    query: url.searchParams,
+    body,
+    verifyCurrentSrp: proof => verifyProof(c.env.DB, user, proof, 'session-reauth', session),
+  });
+  return c.json(result.body, result.status as 200);
 });
 
 app.post('/api/auth/register', async c => {
@@ -753,12 +919,44 @@ app.post('/api/auth/upgrade-srp', async c => {
   const { srp_salt: salt, srp_verifier: verifier, srp_group: group, srp_kdf: kdf } = body;
   if (typeof salt !== 'string' || salt.length > 32 || typeof verifier !== 'string' || verifier.length > 400 || group !== '2048' || !isCreatableSrpKdf(kdf)) return c.json({ error: 'Invalid SRP parameters' }, 400);
   if (!validCredentials(salt, verifier)) return c.json({ error: 'Invalid SRP parameters' }, 400);
+
+  // Auth owns both the verifier and the Vault envelope. A password change must
+  // re-wrap VK in the same transaction, otherwise the vault is orphaned.
+  const rewrapError = await validateVaultRewrap(c.env.DB, user.id, body.vault_kek);
+  if (rewrapError) return c.json({ error: rewrapError.error }, rewrapError.status as 200);
+  const rewrap = body.vault_kek as
+    | { salt: string; kdf_params: unknown; wrapped_vk: string; vk_version: number }
+    | undefined;
+
   if (!await verifyProof(c.env.DB, user, body.current_srp, 'session-reauth', session)) return c.json({ error: 'Current password is incorrect' }, 401);
-  const updated = await c.env.DB.batch([
-    c.env.DB.prepare('UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ? WHERE id = ? AND srp_verifier = ? AND srp_salt = ? AND NOT EXISTS (SELECT 1 FROM flaxia_credential_guards WHERE user_id = users.id)').bind(salt, verifier, group, kdf, '', user.id, user.srp_verifier, user.srp_salt),
-    c.env.DB.prepare('DELETE FROM flaxia_legacy_fingerprints WHERE user_id = ? AND changes() = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?)').bind(user.id, user.id, salt, verifier),
-  ]);
-  if (!updated[0].meta.changes) return c.json({ error: 'Credentials changed or linked to Flaxia' }, 409);
+  const statements: D1PreparedStatement[] = [
+    c.env.DB.prepare(`UPDATE users SET srp_salt = ?, srp_verifier = ?, srp_group = ?, srp_kdf = ?, password_hash = ?
+      WHERE id = ? AND srp_verifier = ? AND srp_salt = ? AND NOT EXISTS (SELECT 1 FROM flaxia_credential_guards WHERE user_id = users.id)
+        AND (? = 0 OR EXISTS (SELECT 1 FROM vault_keys WHERE user_id = users.id AND vk_version = ?))`)
+      .bind(salt, verifier, group, kdf, '', user.id, user.srp_verifier, user.srp_salt, rewrap ? 1 : 0, rewrap?.vk_version ?? 0),
+  ];
+  if (rewrap) {
+    const version = rewrap.vk_version;
+    statements.push(
+      c.env.DB.prepare(`UPDATE vault_keys SET salt = ?, kdf_params = ?, wrapped_vk = ?,
+        vk_version = vk_version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE user_id = ? AND vk_version = ?`)
+        .bind(rewrap.salt, JSON.stringify(rewrap.kdf_params), rewrap.wrapped_vk, user.id, version),
+      c.env.DB.prepare(`UPDATE vault_items SET vk_version = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE user_id = ? AND vk_version = ?
+          AND EXISTS (SELECT 1 FROM vault_keys WHERE user_id = ? AND vk_version = ?)`)
+        .bind(version + 1, user.id, version, user.id, version + 1),
+    );
+  }
+  statements.push(
+    c.env.DB.prepare(`DELETE FROM flaxia_legacy_fingerprints WHERE user_id = ?
+      AND EXISTS (SELECT 1 FROM users WHERE id = ? AND srp_salt = ? AND srp_verifier = ?)`)
+      .bind(user.id, user.id, salt, verifier),
+  );
+  const updated = await c.env.DB.batch(statements);
+  if (!updated[0].meta.changes || (rewrap && !updated[1].meta.changes)) {
+    return c.json({ error: 'Credentials changed or linked to Flaxia' }, 409);
+  }
   return c.json({ success: true });
 });
 app.post('/api/auth/logout', async c => {
@@ -777,6 +975,7 @@ export default {
       env.DB.prepare('DELETE FROM flaxia_legacy_fingerprints WHERE expires_at <= ?').bind(now),
       env.DB.prepare('DELETE FROM flaxia_deletion_cancellations WHERE expires_at <= ?').bind(now),
       env.DB.prepare("DELETE FROM flaxia_email_changes WHERE state = 'cancelled' AND expires_at <= ?").bind(now),
+      env.DB.prepare("DELETE FROM device_keys WHERE state = 'pending' AND expires_at <= ?").bind(now),
       env.DB.prepare('DELETE FROM sessions WHERE expires_at <= ?').bind(now),
     ]);
   },

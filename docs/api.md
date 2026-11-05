@@ -54,6 +54,34 @@ Base URL: `https://auth.flaxia.app`
 
 `POST /api/auth/upgrade-srp` は新しい `srp_salt`、`srp_verifier`、`srp_group`、`srp_kdf` と、再認証で得た `{ "challenge_id", "A", "M1" }` を `current_srp` として受け取ります。成功時は `{ "success": true }` を返します。
 
+Vaultが有効なアカウントでは、同じリクエストに `vault_kek` が必要です。`vault_kek` は新しいパスワードから導出したKEKでVKをラップし直した `{ "salt", "kdf_params", "wrapped_vk", "vk_version" }` です。`vk_version` が現在の封筒と一致しない場合は409 `vault_key_version_conflict`、省略した場合は409 `vault_rewrap_required` を返し、検証子も封筒も変更しません。Authは検証子と封筒を同じD1トランザクションで更新します。
+
+## Personal Vault
+
+Vaultの暗号化はすべてブラウザで行います。Authが保存するのはラップ済みのVK、復旧用ブロブ、アイテム鍵、暗号文だけです。パスワード、KEK、REK、VK、アイテム鍵、復旧フレーズは送信しません。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/api/vault/keys` | 封筒と端末一覧。未作成時は `{ "enabled": false }` |
+| POST | `/api/vault/keys` | Vaultの有効化。`current_srp` が必要 |
+| PUT | `/api/vault/keys` | 封筒の更新。`current_srp` と `vk_version` が必要 |
+| GET | `/api/vault/items[?kind=...]` | アイテム一覧。`kind` 指定時のみ `payload` を含む |
+| PUT | `/api/vault/items/:id` | アイテムの作成・更新。`vk_version` は楽観ロック |
+| DELETE | `/api/vault/items/:id?vk_version=...` | アイテムの削除 |
+| DELETE | `/api/vault/items?kind=...&vk_version=...` | 指定kindの一括削除 |
+| POST | `/api/vault/keys/revoke-device` | 端末失効とVKローテーション。`current_srp`、`vk_version`、全アイテム鍵が必要 |
+| POST | `/api/vault/devices` | ペアリング開始。`{ "label", "peer_pub", "ttl_seconds"? }` |
+| GET | `/api/vault/devices` | 端末一覧 |
+| GET | `/api/vault/devices/:id` | ペアリング状態（`pending` / `active` / `expired`） |
+| POST | `/api/vault/devices/:id/approve` | `{ "approved_pub", "peer_pub", "wrapped_vk" }` で承認 |
+| DELETE | `/api/vault/devices/:id` | 保留中のペアリングのみ取り消し |
+
+アイテムは1アカウント200件、暗号文は1件128KB、合計5MBまでです。`kind` は `post_autosave`、`post_draft`、`private_note`、`personal_setting` のいずれかです。`vk_version` が古い書き込みは409で拒否します。
+
+FlaxiaはService Bindingの `POST /api/flaxia/vault` に `{ "grant", "user_id", "method", "path", "query"?, "body"? }` を送ることで、同じVault APIを利用できます。`current_srp` はグラントに紐づく再認証チャレンジで検証されます。
+
+Flaxia D1に残る移行前のVault行は、初回のVaultアクセス時にFlaxiaが `POST /api/flaxia/vault/import` へ一度だけコピーします。本文は `{ "grant", "user_id", "keys", "devices", "items" }` で、`keys` は封筒、`devices` と `items` は行の配列です。すべてクライアントが生成したラップ済みの値で、サーバーは形状と件数だけを検証します。同じ封筒の再送は `{ "success": true, "imported": false }` を返し、異なる封筒で既存Vaultを置き換えようとすると409 `vault_import_conflict` になります。
+
 ## 制限と旧方式
 
 認証APIはリクエスト元IPごとに各パスで毎分20回、SRPログイン開始と旧方式ログインはそれぞれユーザーごとに毎分5回までです。超過時は429を返します。

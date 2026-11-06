@@ -276,6 +276,20 @@ test('Personal Vault is owned by Auth and uses the Auth session', { timeout: 900
   assert.equal((await request(`/api/vault/items/${itemId}?vk_version=4`, { method: 'DELETE', cookie })).status, 200);
   assert.equal((await request(`/api/vault/items/${itemId}?vk_version=4`, { method: 'DELETE', cookie })).status, 404);
 
+  // Flaxia-specific item kinds (Mail identity and the E2EE recommendation
+  // profile) are valid in the Auth-owned Vault as well.
+  for (const kind of ['mail_identity', 'recommendation_profile']) {
+    const kindItemId = `kind_${kind.slice(0, 20).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const kindItem = { item_key_wrapped: wrapped(), payload: wrapped(80), kind, vk_version: 4 };
+    assert.equal(
+      (await request(`/api/vault/items/${kindItemId}`, { method: 'PUT', cookie, body: kindItem })).status,
+      200,
+      kind,
+    );
+    const kindPayloads = await (await request(`/api/vault/items?kind=${kind}`, { method: 'GET', cookie })).json();
+    assert.equal(kindPayloads.items[0].kind, kind);
+  }
+
   // Service-bound access uses the same store and a grant-bound proof, so
   // Flaxia can proxy the routes without holding wrapped keys in its D1.
   const bridgePort = await freePort();

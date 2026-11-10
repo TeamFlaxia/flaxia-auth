@@ -38,7 +38,7 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   const seed = spawnSync(process.execPath, [wrangler, 'd1', 'execute', 'flaxia-auth-prod', '--local', '--persist-to', directory, '--command', seedSql], { encoding: 'utf8', env: { ...process.env, CI: 'true' } });
   assert.equal(seed.status, 0, seed.stdout + seed.stderr);
   const port = await freePort();
-  const worker = spawn(process.execPath, [wrangler, 'dev', '--local', '--ip', '127.0.0.1', '--port', String(port), '--persist-to', directory], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: 'true' } });
+  const worker = spawn(process.execPath, [wrangler, 'dev', '--local', '--ip', '127.0.0.1', '--port', String(port), '--inspector-port', '0', '--persist-to', directory], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: 'true' } });
   let output = '';
   worker.stdout.on('data', data => { output += data; });
   worker.stderr.on('data', data => { output += data; });

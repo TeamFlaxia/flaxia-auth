@@ -5,40 +5,20 @@ import { cors } from 'hono/cors';
 import { bodyLimit } from 'hono/body-limit';
 import { isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, serverStep2 } from './srp';
 import { originAllowed } from './origin';
+import { enc, dec, random, sha256url, expiry, rateLimit, requestIp } from './util';
+import { cookieName, cookieOptions, sessionUser, User } from './session';
+import { createOAuthApp, createOAuthBridgeApp } from './oauth';
 
 const app = new Hono<{ Bindings: Env }>();
 const bridge = new Hono<{ Bindings: Env }>();
-const enc = (data: Uint8Array) => btoa(String.fromCharCode(...data));
-const dec = (value: string) => Uint8Array.from(atob(value), c => c.charCodeAt(0));
 const validCredentials = (salt: string, verifier: string): boolean => {
   try {
     const s = dec(salt), v = dec(verifier);
     return s.length === 16 && enc(s) === salt && enc(v) === verifier && isValidVerifier(v);
   } catch { return false; }
 };
-const random = () => enc(crypto.getRandomValues(new Uint8Array(32))).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
-const sha256url = async (value: string) => enc(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
-const expiry = (ms: number) => new Date(Date.now() + ms).toISOString();
-const cookieName = '__Host-flaxia_session';
-const cookieOptions = { httpOnly: true, secure: true, sameSite: 'Lax' as const, path: '/' };
-
-type User = { id: string; username: string; display_name: string; password_hash: string; srp_salt: string | null; srp_verifier: string | null; srp_group: string | null; srp_kdf: string | null; frozen_at: string | null };
 type Handshake = { user_id: string; b_scalar: string; b_pub: string };
 type SrpProof = { challenge_id?: unknown; A?: unknown; M1?: unknown };
-
-async function rateLimit(db: D1Database, key: string, limit: number): Promise<boolean> {
-  const now = Math.floor(Date.now() / 1000);
-  const result = await db.prepare(`INSERT INTO auth_rate_limits (key, window_start, attempts) VALUES (?, ?, 1)
-    ON CONFLICT(key) DO UPDATE SET attempts = CASE WHEN window_start <= ? - 60 THEN 1 ELSE attempts + 1 END,
-    window_start = CASE WHEN window_start <= ? - 60 THEN ? ELSE window_start END RETURNING attempts`)
-    .bind(key, now, now, now, now).first<{ attempts: number }>();
-  return !result || result.attempts > limit;
-}
-
-function requestIp(c: { req: { header(name: string): string | undefined } }): string {
-  const value = c.req.header('CF-Connecting-IP') ?? 'unknown';
-  return value.length <= 64 && /^[0-9a-fA-F:.]+$/.test(value) ? value : 'invalid';
-}
 
 async function verifyLegacyPassword(password: string, stored: string): Promise<boolean> {
   let combined: Uint8Array;
@@ -49,11 +29,6 @@ async function verifyLegacyPassword(password: string, stored: string): Promise<b
   let difference = 0;
   for (let i = 0; i < 32; i++) difference |= actual[i] ^ combined[i + 16];
   return difference === 0;
-}
-
-async function sessionUser(db: D1Database, token: string | undefined): Promise<User | null> {
-  if (!token) return null;
-  return db.prepare('SELECT u.* FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.id = ? AND s.expires_at > ? AND u.frozen_at IS NULL').bind(token, new Date().toISOString()).first<User>();
 }
 
 async function verifyProof(db: D1Database, user: User, input: unknown, purpose: 'session-reauth' | 'grant-reauth', binding: string): Promise<boolean> {
@@ -541,6 +516,8 @@ bridge.post('/api/flaxia/reauth/verify', bodyLimit({ maxSize: 2048 }), async c =
   return c.json({ valid: await verifyProof(c.env.DB, user, body, 'grant-reauth', body.grant as string) });
 });
 
+bridge.route('/', createOAuthBridgeApp());
+
 export class FlaxiaBridge extends WorkerEntrypoint<Env> {
   async fetch(request: Request): Promise<Response> {
     return bridge.fetch(request, this.env, this.ctx);
@@ -768,6 +745,8 @@ app.post('/api/auth/logout', async c => {
   return c.json({ success: true });
 });
 
+app.route('/', createOAuthApp());
+
 export default {
   fetch: app.fetch,
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
@@ -778,6 +757,9 @@ export default {
       env.DB.prepare('DELETE FROM flaxia_deletion_cancellations WHERE expires_at <= ?').bind(now),
       env.DB.prepare("DELETE FROM flaxia_email_changes WHERE state = 'cancelled' AND expires_at <= ?").bind(now),
       env.DB.prepare('DELETE FROM sessions WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM oauth_authorization_codes WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM oauth_access_tokens WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM oauth_refresh_tokens WHERE expires_at <= ?').bind(now),
     ]);
   },
 };

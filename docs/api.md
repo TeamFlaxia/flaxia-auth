@@ -72,3 +72,19 @@ Base URL: `https://auth.flaxia.app`
 ```
 
 `srp_salt` と `srp_verifier` はブラウザ側で現在のパスワードから計算します。Cloudflare Workers の WebCrypto は PBKDF2 の反復回数が100,000回以下のため、サーバー側では600,000回のv2検証子を計算できません。サーバーは旧パスワードを検証したうえで、受け取った検証子を保存し、旧ハッシュを削除してセッションを発行します。以後はSRPログインを使ってください。既にSRPへ移行済みのアカウントはこのエンドポイントを使えません。
+
+## OAuth 2.0 / OpenID Connect
+
+OAuth 2.0 / OpenID Connect のエンドポイントは `/oauth/*` と `/.well-known/*` です。認可コード + PKCE フロー、ID トークン、UserInfo、リフレッシュトークン、失効、ディスカバリ、JWKS を提供します。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/.well-known/openid-configuration` | OIDCディスカバリ |
+| GET | `/.well-known/oauth-authorization-server` | RFC 8414 メタデータ |
+| GET | `/oauth/jwks` | 公開鍵セット（RS256） |
+| GET | `/oauth/authorize` | 認可エンドポイント |
+| POST | `/oauth/token` | トークンエンドポイント |
+| GET | `/oauth/userinfo` | UserInfo |
+| POST | `/oauth/revoke` | トークン失効 |
+
+詳細は [oauth-oidc.md](oauth-oidc.md) を参照してください。

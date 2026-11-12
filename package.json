@@ -8,17 +8,20 @@
   },
   "packageManager": "npm@10.9.9",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "dev": "npm run build && wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
     "cf-typegen": "wrangler types",
-    "typecheck": "wrangler types --check && tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/*.test.js tests/*.test.ts"
+    "typecheck": "wrangler types --check && tsc --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "test": "node --experimental-strip-types --test --test-concurrency=1 tests/*.test.js tests/*.test.ts",
+    "build": "esbuild src/web/login.ts --bundle --format=esm --outfile=public/auth.js",
+    "pretest": "npm run build"
   },
   "dependencies": {
     "hono": "^4.13.14"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
+    "esbuild": "^0.25.12",
     "typescript": "^7.0.2",
     "wrangler": "^4.154.0"
   }

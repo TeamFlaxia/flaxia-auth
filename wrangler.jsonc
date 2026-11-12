@@ -2,6 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "flaxia-auth",
   "main": "src/index.ts",
+  "assets": { "directory": "./public", "binding": "ASSETS" },
   "compatibility_date": "2026-10-28",
   "triggers": { "crons": ["0 * * * *"] },
   "routes": [

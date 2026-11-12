@@ -20,6 +20,7 @@ Base URL: `https://auth.flaxia.app`
 | POST | `/api/auth/reauth/start` | 現在のユーザーの再認証を開始 |
 | POST | `/api/auth/reauth/verify` | 再認証の証明を検証 |
 | POST | `/api/auth/upgrade-srp` | 本人確認後にSRP情報を更新 |
+| POST | `/api/auth/recovery/enroll` | ログイン中のセッションで復旧コードを登録・更新 |
 
 ## 登録
 
@@ -36,11 +37,11 @@ Base URL: `https://auth.flaxia.app`
 }
 ```
 
-`username` は半角英数字と `_` の1〜20文字で、大文字と小文字を区別せずに一意です。`display_name` は省略でき、指定する場合は1〜50文字です。成功時はHTTP 201で `{ "user": { "id", "username", "display_name" } }` を返し、セッションCookieを発行します。重複時は409です。
+`username` は半角英数字と `_` の1〜20文字で、大文字と小文字を区別せずに一意です。`display_name` は省略でき、指定する場合は1〜50文字です。`email` は任意で、指定するとログインの識別子としても使えます。成功時はHTTP 201で `{ "user": { "id", "username", "display_name" } }` を返し、セッションCookieを発行します。重複時は409です。
 
 ## ログイン
 
-1. `POST /api/auth/login/start` に `{ "username": "example_user" }` を送ります。成功時は `challenge_id`、`salt`、`B`、`srp_kdf` と `srp: true` を返します。
+1. `POST /api/auth/login/start` に `{ "username": "example_user" }` を送ります。`username` の代わりに `{ "email": "user@example.com" }` も使えます。成功時は `challenge_id`、`salt`、`B`、`srp_kdf` と `srp: true` を返します。
 2. クライアントは指定されたKDFで `A` と `M1` を計算し、`POST /api/auth/login/verify` に `{ "challenge_id", "A", "M1" }` を送ります。
 3. 成功時は `{ "user", "M2" }` とセッションCookieを返します。クライアントは `M2` を検証してください。
 
@@ -53,6 +54,50 @@ Base URL: `https://auth.flaxia.app`
 `POST /api/auth/reauth/start` はログイン済みユーザーに `challenge_id`、`salt`、`B`、`srp_kdf` を返します。`POST /api/auth/reauth/verify` へ `{ "challenge_id", "A", "M1" }` を送り、`{ "valid": true | false }` を受け取ります。チャレンジは一度だけ使えます。
 
 `POST /api/auth/upgrade-srp` は新しい `srp_salt`、`srp_verifier`、`srp_group`、`srp_kdf` と、再認証で得た `{ "challenge_id", "A", "M1" }` を `current_srp` として受け取ります。成功時は `{ "success": true }` を返します。
+
+Vaultが有効なアカウントでは、同じリクエストに `vault_kek` が必要です。`vault_kek` は新しいパスワードから導出したKEKでVKをラップし直した `{ "salt", "kdf_params", "wrapped_vk", "vk_version" }` です。`vk_version` が現在の封筒と一致しない場合は409 `vault_key_version_conflict`、省略した場合は409 `vault_rewrap_required` を返し、検証子も封筒も変更しません。Authは検証子と封筒を同じD1トランザクションで更新します。
+
+## Personal Vault
+
+Vaultの暗号化はすべてブラウザで行います。Authが保存するのはラップ済みのVK、復旧用ブロブ、アイテム鍵、暗号文だけです。パスワード、KEK、REK、VK、アイテム鍵、復旧フレーズは送信しません。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/api/vault/keys` | 封筒と端末一覧。未作成時は `{ "enabled": false }` |
+| POST | `/api/vault/keys` | Vaultの有効化。`current_srp` が必要 |
+| PUT | `/api/vault/keys` | 封筒の更新。`current_srp` と `vk_version` が必要 |
+| GET | `/api/vault/items[?kind=...]` | アイテム一覧。`kind` 指定時のみ `payload` を含む |
+| PUT | `/api/vault/items/:id` | アイテムの作成・更新。`vk_version` は楽観ロック |
+| DELETE | `/api/vault/items/:id?vk_version=...` | アイテムの削除 |
+| DELETE | `/api/vault/items?kind=...&vk_version=...` | 指定kindの一括削除 |
+| POST | `/api/vault/keys/revoke-device` | 端末失効とVKローテーション。`current_srp`、`vk_version`、全アイテム鍵が必要 |
+| POST | `/api/vault/devices` | ペアリング開始。`{ "label", "peer_pub", "ttl_seconds"? }` |
+| GET | `/api/vault/devices` | 端末一覧 |
+| GET | `/api/vault/devices/:id` | ペアリング状態（`pending` / `active` / `expired`） |
+| POST | `/api/vault/devices/:id/approve` | `{ "approved_pub", "peer_pub", "wrapped_vk" }` で承認 |
+| DELETE | `/api/vault/devices/:id` | 保留中のペアリングのみ取り消し |
+
+アイテムは1アカウント200件、暗号文は1件128KB、合計5MBまでです。`kind` は `post_autosave`、`post_draft`、`private_note`、`personal_setting` のいずれかです。`vk_version` が古い書き込みは409で拒否します。
+
+FlaxiaはService Bindingの `POST /api/flaxia/vault` に `{ "grant", "user_id", "method", "path", "query"?, "body"? }` を送ることで、同じVault APIを利用できます。`current_srp` はグラントに紐づく再認証チャレンジで検証されます。
+
+Flaxia D1に残る移行前のVault行は、初回のVaultアクセス時にFlaxiaが `POST /api/flaxia/vault/import` へ一度だけコピーします。本文は `{ "grant", "user_id", "keys", "devices", "items" }` で、`keys` は封筒、`devices` と `items` は行の配列です。すべてクライアントが生成したラップ済みの値で、サーバーは形状と件数だけを検証します。同じ封筒の再送は `{ "success": true, "imported": false }` を返し、異なる封筒で既存Vaultを置き換えようとすると409 `vault_import_conflict` になります。
+
+## OAuth 2.0 / OpenID Connect
+
+OAuth 2.0 / OpenID Connect のエンドポイントは `/oauth/*` と `/.well-known/*` です。認可コード + PKCE フロー、ID トークン、UserInfo、リフレッシュトークン、失効、ディスカバリ、JWKS を提供します。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/.well-known/openid-configuration` | OIDCディスカバリ |
+| GET | `/.well-known/oauth-authorization-server` | RFC 8414 メタデータ |
+| GET | `/oauth/jwks` | 公開鍵セット（RS256） |
+| GET | `/oauth/authorize` | 認可エンドポイント |
+| POST | `/oauth/token` | トークンエンドポイント |
+| GET | `/oauth/userinfo` | UserInfo |
+| POST | `/oauth/revoke` | トークン失効 |
+
+詳細は [oauth-oidc.md](oauth-oidc.md) を参照してください。
 
 ## 制限と旧方式
 
@@ -73,18 +118,26 @@ Base URL: `https://auth.flaxia.app`
 
 `srp_salt` と `srp_verifier` はブラウザ側で現在のパスワードから計算します。Cloudflare Workers の WebCrypto は PBKDF2 の反復回数が100,000回以下のため、サーバー側では600,000回のv2検証子を計算できません。サーバーは旧パスワードを検証したうえで、受け取った検証子を保存し、旧ハッシュを削除してセッションを発行します。以後はSRPログインを使ってください。既にSRPへ移行済みのアカウントはこのエンドポイントを使えません。
 
-## OAuth 2.0 / OpenID Connect
+## ログイン画面
 
-OAuth 2.0 / OpenID Connect のエンドポイントは `/oauth/*` と `/.well-known/*` です。認可コード + PKCE フロー、ID トークン、UserInfo、リフレッシュトークン、失効、ディスカバリ、JWKS を提供します。
+`GET /login` と `GET /register` は Auth が配信するログイン UI を返します。画面は
+クエリの `code_challenge`（S256）、`state`、`return_uri` を受け取り、ログイン成功後に
+`POST /api/auth/flaxia/authorize` で取得した一度限りの `code` を付けて
+`return_uri` へ遷移します。`return_uri` は `src/origin.ts` の許可リストに完全一致
+するものだけを受け付けます。詳しい背景は [login-ui.md](login-ui.md) を参照してください。
 
-| Method | Path | 用途 |
-| --- | --- | --- |
-| GET | `/.well-known/openid-configuration` | OIDCディスカバリ |
-| GET | `/.well-known/oauth-authorization-server` | RFC 8414 メタデータ |
-| GET | `/oauth/jwks` | 公開鍵セット（RS256） |
-| GET | `/oauth/authorize` | 認可エンドポイント |
-| POST | `/oauth/token` | トークンエンドポイント |
-| GET | `/oauth/userinfo` | UserInfo |
-| POST | `/oauth/revoke` | トークン失効 |
+## 復旧コードの登録
 
-詳細は [oauth-oidc.md](oauth-oidc.md) を参照してください。
+`POST /api/auth/recovery/enroll` はログイン済みセッションと、現在のパスワードを
+証明する SRP の `current_srp` を必要とします。
+
+```json
+{
+  "salt": "<Base64の16バイトのsalt>",
+  "verifier": "<Base64の256バイトのverifier>",
+  "kdf": "pbkdf2-600k-v2",
+  "current_srp": { "challenge_id": "...", "A": "...", "M1": "..." }
+}
+```
+
+成功時は `{ "success": true }` を返し、現在のセッション以外のセッションを失効させます。

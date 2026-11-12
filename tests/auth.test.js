@@ -73,6 +73,9 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal(preflight.status, 204);
   assert.equal(preflight.headers.get('access-control-allow-origin'), 'https://flaxia.app');
   assert.equal(preflight.headers.get('access-control-allow-credentials'), 'true');
+  const loginPage = await fetch(`${base}/login`);
+  assert.equal(loginPage.status, 200);
+  assert.match(await loginPage.text(), /Flaxia/);
   assert.equal(originAllowed('https://auth.flaxia.app'), true);
   assert.equal(originAllowed('https://id.flaxia.app'), false);
   const deniedPreflight = await fetch(`${base}/api/auth/register`, { method: 'OPTIONS', headers: { Origin: 'https://evil.example', 'Access-Control-Request-Method': 'POST' } });
@@ -87,7 +90,7 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal((await request('/api/auth/register', { body: registration, origin: 'https://evil.example' })).status, 403);
   assert.equal((await request('/api/auth/register', { body: registration, origin: '' })).status, 403);
   assert.equal((await request('/api/auth/register', { body: { ...registration, srp_kdf: 'sha256-v1' } })).status, 400);
-  const registered = await request('/api/auth/register', { body: { ...registration, display_name: 'Test User' } });
+  const registered = await request('/api/auth/register', { body: { ...registration, display_name: 'Test User', email: 'TestUser@Example.com' } });
   assert.equal(registered.status, 201);
   assert.equal(registered.headers.get('access-control-allow-origin'), 'https://flaxia.app');
   assert.equal(registered.headers.get('access-control-allow-credentials'), 'true');
@@ -103,6 +106,11 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   assert.equal(start.status, 200);
   const challenge = await start.json();
   assert.equal(challenge.srp_kdf, 'pbkdf2-600k-v2');
+  for (const body of [{ username: 'testuser@example.com' }, { email: 'testuser@example.com' }]) {
+    const byEmail = await request('/api/auth/login/start', { body, ip: '192.0.2.11' });
+    assert.equal(byEmail.status, 200, await byEmail.clone().text());
+    assert.equal((await byEmail.json()).srp, true);
+  }
   const first = await clientStep1(password, decode(challenge.salt));
   const proof = await clientStep2(password, decode(challenge.salt), first.a, decode(challenge.B));
   const body = { challenge_id: challenge.challenge_id, A: encode(proof.A), M1: encode(proof.M1) };
@@ -205,6 +213,9 @@ test('authentication API with a local D1 database', { timeout: 60000 }, async t 
   const authCookie = convertedLogin.headers.get('set-cookie').split(';')[0];
   const pkceVerifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
   const pkceChallenge = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pkceVerifier))).toString('base64url');
+  assert.equal((await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: pkceChallenge }, origin: 'https://evil.example', ip: '192.0.2.13' })).status, 403);
+  const authOriginAuthorize = await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: pkceChallenge }, origin: 'https://auth.flaxia.app', ip: '192.0.2.13' });
+  assert.equal(authOriginAuthorize.status, 200);
   const authorize = await request('/api/auth/flaxia/authorize', { cookie: authCookie, body: { challenge: pkceChallenge }, ip: '192.0.2.13' });
   assert.equal(authorize.status, 200);
   const { code } = await authorize.json();

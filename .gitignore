@@ -3,3 +3,4 @@ node_modules/
 .wrangler/
 coverage/
 dist/
+public/auth.js

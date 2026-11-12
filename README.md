@@ -12,8 +12,9 @@ Flaxia向けの認証サービスです。Cloudflare Workers、Hono、TypeScript
 - `HttpOnly` / `Secure` / `SameSite=Lax` のセッションCookie、ログアウト、Origin検証、レート制限
 - ブラウザ生成の復旧コードによるアカウント復旧
 - Authが管理するPersonal Vault（暗号化された鍵、アイテム、端末ペアリング）
+- 外部サービスへのOAuth接続（トークンはブラウザが保持し、Authは暗号文のみ保存）
 - FlaxiaとのService Binding連携（プロビジョニング、セッション交換、グラント失効、パスワード・メール変更、凍結、削除）
-- 期限切れのセッション、認可コード、レガシーフィンガープリント、削除キャンセル、メール変更記録、Vault端末ペアリングの毎時クリーンアップ
+- 期限切れのセッション、認可コード、レガシーフィンガープリント、削除キャンセル、メール変更記録、Vault端末ペアリング、OAuthトランザクションの毎時クリーンアップ
 
 WebAuthn / パスキー、OIDC / Sign in with Flaxia、SDKは未実装です。
 
@@ -22,11 +23,12 @@ WebAuthn / パスキー、OIDC / Sign in with Flaxia、SDKは未実装です。
 ```text
 src/index.ts   認証APIとFlaxia連携エンドポイント
 src/vault.ts   Personal Vaultの保存、検証、端末ペアリング
+src/oauth/     外部サービスへのOAuth接続（レジストリ、トランザクション、seal、ルート）
 src/srp.ts     SRP-6aとKDFの実装
 src/origin.ts  許可するOriginの定義
 migrations/    D1スキーマとマイグレーション
 docs/          API、移行設計、セキュリティレビュー
-tests/         認証・移行・競合・Vaultのテスト
+tests/         認証・移行・競合・Vault・OAuthのテスト
 ```
 
 ## 開発
@@ -91,6 +93,12 @@ npx wrangler d1 migrations apply flaxia-auth-prod --remote
 | GET | `/api/vault/devices/:id` | ペアリング状態の取得 |
 | POST | `/api/vault/devices/:id/approve` | ペアリングの承認 |
 | DELETE | `/api/vault/devices/:id` | 保留中のペアリングの取り消し |
+| POST | `/api/connections/:provider/start` | 外部サービスへのOAuth接続を開始 |
+| GET | `/api/connections/:provider/callback` | プロバイダからの戻りを処理 |
+| GET | `/api/connections` | 接続一覧（メタデータのみ） |
+| POST | `/api/connections/:provider/exchange` | 方式Sのトークン交換（結果をsealして返す） |
+| POST | `/api/connections/:provider/complete` | 接続のメタデータを記録 |
+| DELETE | `/api/connections/:provider` | 接続を破棄 |
 
 Flaxiaからの信頼済みリクエストは、公開ルートではなく `FlaxiaBridge` のService Bindingで受けます。プロビジョニング、セッション交換、グラント失効、認証情報・メール変更、復旧コード登録、削除、凍結などのエンドポイントは `/api/flaxia/*` にあります。Vaultも `/api/flaxia/vault` で同じ保存領域へ委譲でき、Flaxia D1にラップ済み鍵を置く必要はありません。移行前にFlaxia D1へ保存されたVault行は `POST /api/flaxia/vault/import` で一度だけコピーでき、同じ封筒の再送は冪等、異なる封筒は409で拒否します。
 
@@ -101,6 +109,7 @@ SRPの計算と主要な認証フローは[docs/api.md](docs/api.md)を参照し
 - パスワードはSRPの検証子としてのみ保存し、サーバーへ平文を送信しません。例外は旧方式アカウントの初回移行だけです。
 - 復旧コードとVaultの復旧フレーズはブラウザで生成し、AuthやFlaxiaへ送信しません。Authは復旧コードのSRP検証子だけを保存します。VaultはAuthが封筒、アイテム、端末を保持し、パスワード変更時は検証子と封筒を同じD1トランザクションで更新します。
 - VaultのKEK、REK、VK、アイテム鍵、復旧フレーズはサーバーへ送信しません。Authが受け取るのはラップ済みの不透明な値だけです。
+- OAuth接続のトークンはVaultの `oauth_connection` アイテムとしてブラウザで暗号化します。Authの接続テーブルはメタデータだけを保持し、トークン列を持ちません。stateとPKCE verifierもハッシュ化して保存し、10分・一回限りのトランザクションとして扱います。
 - 旧方式のパスワード由来フィンガープリントは90日で失効し、連携完了、認証情報変更、アカウント削除時に削除されます。
 - Flaxia向けの変更はService Binding経由に限定し、ブラウザからの認証APIは許可Origin、リクエストサイズ、レート制限で保護します。
 - 本番移行では、全対象アカウントの連携状況、復旧コード登録、バックアップの保持期間、独立したセキュリティレビューを確認してください。移行後のロールバックでFlaxiaローカルの認証情報を再び受け入れないでください。

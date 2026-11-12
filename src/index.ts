@@ -6,6 +6,8 @@ import { bodyLimit } from 'hono/body-limit';
 import { isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, serverStep2 } from './srp';
 import { originAllowed } from './origin';
 import { handleVaultRequest, importVault, validateVaultRewrap } from './vault';
+import { handleComplete, handleDelete, handleExchange, handleList, handleStart, handleCallback } from './oauth/routes';
+import type { ConnectionContext } from './oauth/routes';
 
 const app = new Hono<{ Bindings: Env }>();
 const bridge = new Hono<{ Bindings: Env }>();
@@ -1031,6 +1033,51 @@ app.post('/api/auth/logout', async c => {
   return c.json({ success: true });
 });
 
+// ─── OAuth connections ──────────────────────────────────────────────────────
+//
+// The browser drives the authorization. Auth stores the transaction and the
+// connection metadata; the credential itself lives in the Personal Vault as
+// an encrypted `oauth_connection` item, so Auth can never read it.
+app.use('/api/connections/*', cors({ origin: origin => originAllowed(origin) ? origin : '', credentials: true, allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'], allowHeaders: ['Content-Type'] }));
+app.use('/api/connections/*', bodyLimit({ maxSize: 64 * 1024, onError: c => c.json({ error: 'Request too large' }, 413) }));
+app.use('/api/connections/*', async (c, next) => {
+  c.header('Cache-Control', 'no-store');
+  if (c.req.method !== 'GET' && !originAllowed(c.req.header('Origin'))) return c.json({ error: 'Invalid origin' }, 403);
+  const ip = c.req.header('CF-Connecting-IP');
+  if (!ip) return c.json({ error: 'Authentication unavailable' }, 503);
+  if (await rateLimit(c.env.DB, `${c.req.path}:ip:${ip}`, 60)) return c.json({ error: 'Too many requests' }, 429);
+  await next();
+});
+
+const connectionContext = (c: any): ConnectionContext => ({
+  env: c.env,
+  req: c.req,
+  cookie: (name: string) => getCookie(c, name),
+  json: (body: unknown, status?: number) => c.json(body, status as 200),
+  redirect: (location: string) => c.redirect(location),
+  rateLimit: (key: string, limit: number) => rateLimit(c.env.DB, key, limit),
+  sessionUser: (token: string | undefined) => sessionUser(c.env.DB, token),
+  random,
+});
+
+app.post('/api/connections/:provider/start', c => handleStart(connectionContext(c), c.req.param('provider')));
+app.get('/api/connections/:provider/callback', c =>
+  handleCallback(connectionContext(c), c.req.param('provider'), new URL(c.req.url).searchParams));
+app.post('/api/connections/:provider/exchange', async c => {
+  let body: Record<string, unknown>;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'Invalid request' }, 400);
+  return handleExchange(connectionContext(c), c.req.param('provider'), body);
+});
+app.post('/api/connections/:provider/complete', async c => {
+  let body: Record<string, unknown>;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'Invalid request' }, 400);
+  return handleComplete(connectionContext(c), c.req.param('provider'), body);
+});
+app.get('/api/connections', c => handleList(connectionContext(c)));
+app.delete('/api/connections/:provider', c => handleDelete(connectionContext(c), c.req.param('provider')));
+
 export default {
   fetch: app.fetch,
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
@@ -1042,6 +1089,7 @@ export default {
       env.DB.prepare("DELETE FROM flaxia_email_changes WHERE state = 'cancelled' AND expires_at <= ?").bind(now),
       env.DB.prepare("DELETE FROM device_keys WHERE state = 'pending' AND expires_at <= ?").bind(now),
       env.DB.prepare('DELETE FROM sessions WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM oauth_transactions WHERE expires_at <= ?').bind(now),
     ]);
   },
 };

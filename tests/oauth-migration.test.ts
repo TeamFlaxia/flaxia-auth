@@ -19,6 +19,7 @@ const MIGRATIONS = [
   '0013_recovery_factors.sql',
   '0014_vault.sql',
   '0015_oauth_connections.sql',
+  '0016_oauth_transaction_stages.sql',
 ];
 
 function migrated() {
@@ -75,6 +76,8 @@ test('the transaction table keeps only hashes of the state and verifier', () => 
     .map((row: { name: string }) => row.name);
   assert.ok(columns.includes('state_hash'));
   assert.ok(columns.includes('code_verifier_hash'));
+  assert.ok(columns.includes('exchanged_at'));
+  assert.ok(columns.includes('completed_at'));
   for (const forbidden of ['state', 'code_verifier', 'verifier']) {
     assert.equal(columns.includes(forbidden), false, `oauth_transactions must not have ${forbidden}`);
   }

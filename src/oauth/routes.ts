@@ -14,7 +14,7 @@
 import { getCookie } from 'hono/cookie';
 import { getProvider } from './registry.ts';
 import { hashState, isValidCodeVerifier, isValidState, newTransaction, transactionExpired, transactionFromRow } from './flow.ts';
-import { parseConnectionMetadata } from './store.ts';
+import { isValidProviderSub, parseConnectionMetadata } from './store.ts';
 import { sealTo } from './seal.ts';
 
 export interface ConnectionEnv {
@@ -96,7 +96,7 @@ export async function handleStart(ctx: ConnectionContext, providerParam: string 
   }
   const { state, code_challenge: challenge } = body;
   if (!isValidState(state)) return ctx.json({ error: 'Invalid request' }, 400);
-  if (typeof challenge !== 'string' || challenge.length < 43 || challenge.length > 128) {
+  if (!isValidState(challenge)) {
     return ctx.json({ error: 'Invalid request' }, 400);
   }
   const returnUri = body.return_uri === undefined ? RETURN_URIS[0] : body.return_uri;
@@ -129,7 +129,7 @@ export async function handleStart(ctx: ConnectionContext, providerParam: string 
   url.searchParams.set('state', state);
   url.searchParams.set('code_challenge', challenge);
   url.searchParams.set('code_challenge_method', 'S256');
-  url.searchParams.set('scope', definition.scopes.join(' '));
+  url.searchParams.set('scope', definition.scopes.join(definition.scopeSeparator ?? ' '));
   for (const [key, value] of Object.entries(definition.extraAuthParams ?? {})) {
     url.searchParams.set(key, value);
   }
@@ -151,7 +151,7 @@ export async function handleCallback(ctx: ConnectionContext, providerParam: stri
 
   const now = new Date().toISOString();
   const row = await ctx.env.DB.prepare(
-    `SELECT id, user_id, provider, state_hash, code_verifier_hash, redirect_uri, return_uri, expires_at, consumed_at
+    `SELECT id, user_id, provider, state_hash, code_verifier_hash, redirect_uri, return_uri, expires_at, consumed_at, exchanged_at, completed_at
      FROM oauth_transactions WHERE state_hash = ? LIMIT 1`,
   ).bind(await hashState(state)).first();
   const transaction = transactionFromRow(row);
@@ -159,6 +159,22 @@ export async function handleCallback(ctx: ConnectionContext, providerParam: stri
   if (transaction.consumed_at !== null || transactionExpired(transaction, now)) {
     return ctx.json({ error: 'Invalid state' }, 400);
   }
+
+  // The callback may run in a browser that has no Auth session (the native
+  // app opens the provider in the system browser), so a missing session is
+  // allowed. If a session exists it must own the transaction: otherwise an
+  // attacker could start a flow with their own account and hand the callback
+  // to a victim's browser. The exchange and completion endpoints repeat this
+  // binding, which is what actually prevents account linking.
+  const session = ctx.cookie('__Host-flaxia_session');
+  const user = await ctx.sessionUser(session);
+  const returnUri = transaction.return_uri ?? RETURN_URIS[0];
+  if (user && transaction.user_id !== user.id) {
+    const target = new URL(returnUri);
+    target.searchParams.set('oauth_error', 'account_mismatch');
+    return ctx.redirect(target.toString());
+  }
+
   // Consume the transaction atomically. A second callback with the same state
   // finds nothing to consume and fails.
   const consumed = await ctx.env.DB.prepare(
@@ -167,7 +183,6 @@ export async function handleCallback(ctx: ConnectionContext, providerParam: stri
   if (consumed.meta.changes !== 1) return ctx.json({ error: 'Invalid state' }, 400);
 
   const error = query.get('error');
-  const returnUri = transaction.return_uri ?? RETURN_URIS[0];
   if (error) {
     const target = new URL(returnUri);
     target.searchParams.set('oauth_error', error.slice(0, 64));
@@ -227,14 +242,53 @@ export async function handleExchange(ctx: ConnectionContext, providerParam: stri
 
   const code = body.code;
   const clientPublicKey = body.client_public_key;
+  const transactionId = body.transaction_id;
+  const state = body.state;
   if (typeof code !== 'string' || code.length === 0 || code.length > 512) {
     return ctx.json({ error: 'Invalid request' }, 400);
   }
   if (typeof clientPublicKey !== 'string' || clientPublicKey.length === 0) {
     return ctx.json({ error: 'Invalid request' }, 400);
   }
+  if (typeof transactionId !== 'string' || transactionId.length === 0 || transactionId.length > 96) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  if (!isValidState(state)) return ctx.json({ error: 'Invalid transaction' }, 400);
+
+  // A code is only exchanged for the transaction that produced it. Without
+  // this binding an authenticated caller could submit a code from any other
+  // flow and have Auth seal the resulting token to a key of their choosing.
+  const row = await ctx.env.DB.prepare(
+    `SELECT id, user_id, provider, state_hash, code_verifier_hash, redirect_uri, return_uri, expires_at, consumed_at, exchanged_at, completed_at
+     FROM oauth_transactions WHERE id = ? AND provider = ? AND user_id = ? LIMIT 1`,
+  ).bind(transactionId, provider, user.id).first();
+  const transaction = transactionFromRow(row);
+  if (!transaction || transaction.provider !== provider || transaction.user_id !== user.id) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  if (transaction.state_hash !== await hashState(state)) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  const now = new Date().toISOString();
+  if (transaction.consumed_at === null || transaction.exchanged_at !== null || transactionExpired(transaction, now)) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  const reserved = await ctx.env.DB.prepare(
+    `UPDATE oauth_transactions SET exchanged_at = ?
+     WHERE id = ? AND exchanged_at IS NULL AND consumed_at IS NOT NULL AND expires_at > ?`,
+  ).bind(now, transaction.id, now).run();
+  if (reserved.meta.changes !== 1) return ctx.json({ error: 'Invalid transaction' }, 400);
+
+  const releaseExchange = async (): Promise<void> => {
+    await ctx.env.DB.prepare('UPDATE oauth_transactions SET exchanged_at = NULL WHERE id = ? AND exchanged_at = ?')
+      .bind(transaction.id, now).run();
+  };
+
   const clientId = clientIdFor(ctx.env, provider);
-  if (!clientId) return ctx.json({ error: 'Provider is not configured' }, 503);
+  if (!clientId) {
+    await releaseExchange();
+    return ctx.json({ error: 'Provider is not configured' }, 503);
+  }
 
   const params = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -253,22 +307,49 @@ export async function handleExchange(ctx: ConnectionContext, providerParam: stri
   try {
     response = await fetch(definition.tokenUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        // GitHub returns a form body by default; every provider here returns
+        // JSON when asked, and Slack reports errors with HTTP 200 plus
+        // `{ "ok": false }`, so the body has to be inspected either way.
+        Accept: 'application/json',
+      },
       body: params.toString(),
     });
   } catch {
+    await releaseExchange();
     return ctx.json({ error: 'Provider is unreachable' }, 502);
   }
   const text = await response.text();
-  if (!response.ok) return ctx.json({ error: 'Provider rejected the exchange' }, 502);
-  let token: unknown;
-  try { token = JSON.parse(text); } catch { return ctx.json({ error: 'Provider returned an invalid response' }, 502); }
-  if (!token || typeof token !== 'object') return ctx.json({ error: 'Provider returned an invalid response' }, 502);
+  if (!response.ok) {
+    await releaseExchange();
+    return ctx.json({ error: 'Provider rejected the exchange' }, 502);
+  }
+  let token: Record<string, unknown> | null = null;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    token = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    // Some token endpoints answer with `application/x-www-form-urlencoded`
+    // even when JSON was requested.
+    const form = new URLSearchParams(text);
+    token = Object.fromEntries(form.entries());
+  }
+  if (!token) {
+    await releaseExchange();
+    return ctx.json({ error: 'Provider returned an invalid response' }, 502);
+  }
+  if (typeof token.error === 'string' || token.ok === false ||
+      (typeof token.access_token !== 'string' && typeof token.id_token !== 'string')) {
+    await releaseExchange();
+    return ctx.json({ error: 'Provider rejected the exchange' }, 502);
+  }
 
   let sealed: Awaited<ReturnType<typeof sealTo>>;
   try {
     sealed = await sealTo(new TextEncoder().encode(text), clientPublicKey);
   } catch {
+    await releaseExchange();
     return ctx.json({ error: 'Invalid client public key' }, 400);
   }
   return ctx.json({ sealed });
@@ -293,41 +374,99 @@ export async function handleComplete(ctx: ConnectionContext, providerParam: stri
   if (typeof vaultItemId !== 'string' || vaultItemId.length === 0 || vaultItemId.length > 64) {
     return ctx.json({ error: 'Invalid request' }, 400);
   }
-  const providerSub = body.provider_sub;
-  const scopes = Array.isArray(body.scopes) ? body.scopes : [];
+  const transactionId = body.transaction_id;
+  const state = body.state;
+  if (typeof transactionId !== 'string' || transactionId.length === 0 || transactionId.length > 96) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  if (!isValidState(state)) return ctx.json({ error: 'Invalid transaction' }, 400);
+
   const definition = getProvider(provider)!;
+  const row = await ctx.env.DB.prepare(
+    `SELECT id, user_id, provider, state_hash, code_verifier_hash, redirect_uri, return_uri, expires_at, consumed_at, exchanged_at, completed_at
+     FROM oauth_transactions WHERE id = ? AND provider = ? AND user_id = ? LIMIT 1`,
+  ).bind(transactionId, provider, user.id).first();
+  const transaction = transactionFromRow(row);
+  if (!transaction || transaction.provider !== provider || transaction.user_id !== user.id) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  if (transaction.state_hash !== await hashState(state)) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  const now = new Date().toISOString();
+  if (transaction.consumed_at === null || transaction.completed_at !== null || transactionExpired(transaction, now)) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  if (definition.mode === 'server_exchange' && transaction.exchanged_at === null) {
+    return ctx.json({ error: 'Transaction has not been exchanged' }, 400);
+  }
+
+  // The Vault item is client-encrypted, but it still has to belong to this
+  // user and be the kind the connection is allowed to reference.
+  const vaultItem = await ctx.env.DB.prepare(
+    "SELECT id FROM vault_items WHERE user_id = ? AND id = ? AND kind = 'oauth_connection' LIMIT 1",
+  ).bind(user.id, vaultItemId).first();
+  if (!vaultItem) return ctx.json({ error: 'Invalid vault item' }, 400);
+
+  const providerSubRaw = body.provider_sub;
+  if (providerSubRaw !== undefined && providerSubRaw !== null &&
+      (typeof providerSubRaw !== 'string' || !isValidProviderSub(providerSubRaw))) {
+    return ctx.json({ error: 'Invalid provider subject' }, 400);
+  }
+  const providerSub = typeof providerSubRaw === 'string' ? providerSubRaw : null;
+  const validTimestamp = (value: unknown): string | null | undefined => {
+    if (value === undefined || value === null) return null;
+    return typeof value === 'string' && value.length <= 40 && Number.isFinite(Date.parse(value)) ? value : undefined;
+  };
+  const expiresAt = validTimestamp(body.expires_at);
+  const refreshExpiresAt = validTimestamp(body.refresh_expires_at);
+  if (expiresAt === undefined || refreshExpiresAt === undefined) {
+    return ctx.json({ error: 'Invalid expiry' }, 400);
+  }
+  const scopes = Array.isArray(body.scopes) ? body.scopes : [];
   const allowed = new Set(definition.scopes);
   const requested = scopes.filter((scope): scope is string =>
     typeof scope === 'string' && allowed.has(scope));
-  const now = new Date().toISOString();
   const id = `conn_${ctx.random().replace(/[^A-Za-z0-9]/g, '').slice(0, 32).padEnd(20, '0')}`;
-  await ctx.env.DB.prepare(
-    `INSERT INTO oauth_connections (id, user_id, provider, provider_sub, scopes, status, vault_item_id, expires_at, refresh_expires_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
-     ON CONFLICT(user_id, provider) DO UPDATE SET
-       id = excluded.id,
-       provider_sub = excluded.provider_sub,
-       scopes = excluded.scopes,
-       status = 'active',
-       vault_item_id = excluded.vault_item_id,
-       expires_at = excluded.expires_at,
-       refresh_expires_at = excluded.refresh_expires_at,
-       revoked_at = NULL,
-       updated_at = excluded.updated_at`,
-  )
-    .bind(
-      id,
-      user.id,
-      provider,
-      typeof providerSub === 'string' && providerSub.length > 0 ? providerSub.slice(0, 512) : null,
-      JSON.stringify(requested),
-      vaultItemId,
-      typeof body.expires_at === 'string' ? body.expires_at.slice(0, 40) : null,
-      typeof body.refresh_expires_at === 'string' ? body.refresh_expires_at.slice(0, 40) : null,
-      now,
-      now,
+  const completed = await ctx.env.DB.prepare(
+    `UPDATE oauth_transactions SET completed_at = ?
+     WHERE id = ? AND completed_at IS NULL AND consumed_at IS NOT NULL AND expires_at > ?`,
+  ).bind(now, transaction.id, now).run();
+  if (completed.meta.changes !== 1) return ctx.json({ error: 'Invalid transaction' }, 400);
+  try {
+    await ctx.env.DB.prepare(
+      `INSERT INTO oauth_connections (id, user_id, provider, provider_sub, scopes, status, vault_item_id, expires_at, refresh_expires_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, provider) DO UPDATE SET
+         id = excluded.id,
+         provider_sub = excluded.provider_sub,
+         scopes = excluded.scopes,
+         status = 'active',
+         vault_item_id = excluded.vault_item_id,
+         expires_at = excluded.expires_at,
+         refresh_expires_at = excluded.refresh_expires_at,
+         revoked_at = NULL,
+         updated_at = excluded.updated_at`,
     )
-    .run();
+      .bind(
+        id,
+        user.id,
+        provider,
+        providerSub,
+        JSON.stringify(requested),
+        vaultItemId,
+        expiresAt,
+        refreshExpiresAt,
+        now,
+        now,
+      )
+      .run();
+  } catch {
+    // The transaction was not completed after all, so the browser may retry.
+    await ctx.env.DB.prepare('UPDATE oauth_transactions SET completed_at = NULL WHERE id = ? AND completed_at = ?')
+      .bind(transaction.id, now).run();
+    return ctx.json({ error: 'Could not store the connection' }, 500);
+  }
   return ctx.json({ success: true });
 }
 

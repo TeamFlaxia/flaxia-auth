@@ -28,7 +28,9 @@ export interface ConnectionMetadata {
 
 const CONNECTION_ID_PATTERN = /^conn_[A-Za-z0-9_-]{20,40}$/;
 const PROVIDER_SUB_PATTERN = /^[^\s\x00-\x1f\x7f]{1,512}$/;
-const SCOPE_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/;
+// RFC 6749 scope-token: printable ASCII except space, quote and backslash.
+// Google's scopes are full URLs, so `/` has to be accepted.
+const SCOPE_PATTERN = /^[\x21\x23-\x5B\x5D-\x7E]{1,64}$/;
 
 export const isValidConnectionId = (value: unknown): value is string =>
   typeof value === 'string' && CONNECTION_ID_PATTERN.test(value);

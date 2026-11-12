@@ -31,6 +31,8 @@ export interface OAuthProvider {
   tokenUrl: string;
   revokeUrl?: string;
   scopes: string[];
+  /** Slack expects a comma-separated scope list; OAuth uses spaces. */
+  scopeSeparator?: string;
   /** Whether the flow requires a client secret the browser cannot hold. */
   requiresClientSecret: boolean;
   /**
@@ -54,7 +56,11 @@ const PROVIDERS: Record<string, OAuthProvider> = {
     authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
     tokenUrl: 'https://oauth2.googleapis.com/token',
     revokeUrl: 'https://oauth2.googleapis.com/revoke',
-    scopes: ['calendar.readonly', 'gmail.readonly'],
+    // Google only accepts the full scope URLs for Calendar and Gmail.
+    scopes: [
+      'https://www.googleapis.com/auth/calendar.readonly',
+      'https://www.googleapis.com/auth/gmail.readonly',
+    ],
     requiresClientSecret: false,
     clientIdEnv: 'GOOGLE_OAUTH_CLIENT_ID',
     extraAuthParams: { access_type: 'offline', prompt: 'consent' },
@@ -77,6 +83,7 @@ const PROVIDERS: Record<string, OAuthProvider> = {
     authorizeUrl: 'https://slack.com/oauth/v2/authorize',
     tokenUrl: 'https://slack.com/api/oauth.v2.access',
     scopes: ['channels:read', 'channels:history', 'chat:write', 'groups:read', 'im:history', 'users:read'],
+    scopeSeparator: ',',
     requiresClientSecret: false,
     clientIdEnv: 'SLACK_OAUTH_CLIENT_ID',
   },
@@ -193,7 +200,9 @@ export const buildAuthorizeUrl = (providerId: string, options: AuthorizeUrlOptio
   url.searchParams.set('state', options.state);
   url.searchParams.set('code_challenge', options.codeChallenge);
   url.searchParams.set('code_challenge_method', 'S256');
-  if (options.scopes.length > 0) url.searchParams.set('scope', options.scopes.join(' '));
+  if (options.scopes.length > 0) {
+    url.searchParams.set('scope', options.scopes.join(provider.scopeSeparator ?? ' '));
+  }
   for (const [key, value] of Object.entries({ ...provider.extraAuthParams, ...options.extra })) {
     url.searchParams.set(key, value);
   }

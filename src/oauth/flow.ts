@@ -36,6 +36,8 @@ export interface OAuthTransaction {
   return_uri: string | null;
   expires_at: string;
   consumed_at: string | null;
+  exchanged_at: string | null;
+  completed_at: string | null;
 }
 
 export interface NewTransaction {
@@ -89,6 +91,8 @@ export async function newTransaction(input: NewTransaction): Promise<OAuthTransa
     return_uri: input.returnUri ?? null,
     expires_at: new Date(now + TRANSACTION_TTL_MS).toISOString(),
     consumed_at: null,
+    exchanged_at: null,
+    completed_at: null,
   };
 }
 
@@ -108,12 +112,14 @@ export function transactionFromRow(value: unknown): OAuthTransaction | null {
   if (typeof provider !== 'string' || !getProvider(provider)) return null;
   const expiresAt = row.expires_at;
   if (typeof expiresAt !== 'string' || !Number.isFinite(Date.parse(expiresAt))) return null;
-  const consumedAt = row.consumed_at === null || row.consumed_at === undefined
-    ? null
-    : typeof row.consumed_at === 'string' && Number.isFinite(Date.parse(row.consumed_at))
-      ? row.consumed_at
-      : undefined;
-  if (consumedAt === undefined) return null;
+  const stamp = (value: unknown): string | null | undefined => {
+    if (value === null || value === undefined) return null;
+    return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : undefined;
+  };
+  const consumedAt = stamp(row.consumed_at);
+  const exchangedAt = stamp(row.exchanged_at);
+  const completedAt = stamp(row.completed_at);
+  if (consumedAt === undefined || exchangedAt === undefined || completedAt === undefined) return null;
   const stateHash = row.state_hash;
   const verifierHash = row.code_verifier_hash;
   if (typeof stateHash !== 'string' || stateHash.length === 0) return null;
@@ -128,5 +134,7 @@ export function transactionFromRow(value: unknown): OAuthTransaction | null {
     return_uri: typeof row.return_uri === 'string' ? row.return_uri : null,
     expires_at: expiresAt,
     consumed_at: consumedAt,
+    exchanged_at: exchangedAt,
+    completed_at: completedAt,
   };
 }

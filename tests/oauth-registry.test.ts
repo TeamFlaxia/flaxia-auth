@@ -132,7 +132,10 @@ test('buildAuthorizeUrl carries PKCE, state and the exact redirect', () => {
     redirectUri: 'https://auth.flaxia.app/api/connections/google/callback',
     state: 'state-value',
     codeChallenge: 'challenge-value',
-    scopes: ['calendar.readonly', 'gmail.readonly'],
+    scopes: [
+      'https://www.googleapis.com/auth/calendar.readonly',
+      'https://www.googleapis.com/auth/gmail.readonly',
+    ],
     extra: { access_type: 'offline', prompt: 'consent' },
   }));
   assert.equal(url.origin + url.pathname, 'https://accounts.google.com/o/oauth2/v2/auth');
@@ -142,7 +145,10 @@ test('buildAuthorizeUrl carries PKCE, state and the exact redirect', () => {
   assert.equal(url.searchParams.get('state'), 'state-value');
   assert.equal(url.searchParams.get('code_challenge'), 'challenge-value');
   assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
-  assert.equal(url.searchParams.get('scope'), 'calendar.readonly gmail.readonly');
+  assert.equal(
+    url.searchParams.get('scope'),
+    'https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.readonly',
+  );
   assert.equal(url.searchParams.get('access_type'), 'offline');
   assert.equal(url.searchParams.get('prompt'), 'consent');
   // The challenge must never travel in the query as a secret.
@@ -160,6 +166,17 @@ test('buildAuthorizeUrl keeps provider specific extras separate', () => {
   assert.equal(url.origin + url.pathname, 'https://x.com/i/oauth2/authorize');
   assert.equal(url.searchParams.get('scope'), 'tweet.read');
   assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
+});
+
+test('buildAuthorizeUrl uses the scope separator of the provider', () => {
+  const url = new URL(buildAuthorizeUrl('slack', {
+    clientId: 'slack-client',
+    redirectUri: 'https://auth.flaxia.app/api/connections/slack/callback',
+    state: 's',
+    codeChallenge: 'c',
+    scopes: ['channels:read', 'chat:write'],
+  }));
+  assert.equal(url.searchParams.get('scope'), 'channels:read,chat:write');
 });
 
 test('buildAuthorizeUrl refuses a redirect that is not the Auth origin', () => {

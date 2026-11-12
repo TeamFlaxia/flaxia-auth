@@ -172,7 +172,7 @@ test('OAuth connections keep the credential in the Vault and the metadata in Aut
   // The callback hands the code back to the browser and consumes the state.
   const callback = await request(
     `/api/connections/google/callback?code=auth-code&state=${state}`,
-    { method: 'GET' },
+    { method: 'GET', cookie },
   );
   assert.equal(callback.status, 302, await callback.clone().text());
   const location = new URL(callback.headers.get('location'));
@@ -182,10 +182,16 @@ test('OAuth connections keep the credential in the Vault and the metadata in Aut
   assert.equal(location.searchParams.get('oauth_provider'), 'google');
 
   // The same state cannot be replayed.
-  const replay = await request(`/api/connections/google/callback?code=auth-code&state=${state}`, { method: 'GET' });
+  const replay = await request(
+    `/api/connections/google/callback?code=auth-code&state=${state}`,
+    { method: 'GET', cookie },
+  );
   assert.equal(replay.status, 400);
   // An unknown state is refused.
-  const unknown = await request(`/api/connections/google/callback?code=auth-code&state=${'z'.repeat(43)}`, { method: 'GET' });
+  const unknown = await request(
+    `/api/connections/google/callback?code=auth-code&state=${'z'.repeat(43)}`,
+    { method: 'GET', cookie },
+  );
   assert.equal(unknown.status, 400);
   // A provider mismatch is refused: a Slack state does not open Google.
   const slackStart = await request('/api/connections/slack/start', {
@@ -195,7 +201,7 @@ test('OAuth connections keep the credential in the Vault and the metadata in Aut
   assert.equal(slackStart.status, 503, 'Slack has no client id configured in this test');
   const mismatched = await request(
     `/api/connections/google/callback?code=auth-code&state=${'k'.repeat(43)}`,
-    { method: 'GET' },
+    { method: 'GET', cookie },
   );
   assert.equal(mismatched.status, 400);
 
@@ -206,12 +212,37 @@ test('OAuth connections keep the credential in the Vault and the metadata in Aut
   const saved = await request(`/api/vault/items/${vaultItemId}`, { method: 'PUT', cookie, body: vaultItem });
   assert.equal(saved.status, 200, await saved.clone().text());
 
+  const calendarScope = 'https://www.googleapis.com/auth/calendar.readonly';
+  const gmailScope = 'https://www.googleapis.com/auth/gmail.readonly';
+
+  // A completion without the transaction cannot bind a Vault item.
+  const noTransaction = await request('/api/connections/google/complete', {
+    cookie,
+    body: { vault_item_id: vaultItemId, scopes: [calendarScope] },
+  });
+  assert.equal(noTransaction.status, 400);
+
+  // A Vault item that does not belong to the user (or is not the right kind)
+  // is refused.
+  const foreignItem = await request('/api/connections/google/complete', {
+    cookie,
+    body: {
+      transaction_id: start.transaction_id,
+      state,
+      vault_item_id: `item_${'e'.repeat(20)}`,
+      scopes: [calendarScope],
+    },
+  });
+  assert.equal(foreignItem.status, 400);
+
   const completed = await request('/api/connections/google/complete', {
     cookie,
     body: {
+      transaction_id: start.transaction_id,
+      state,
       vault_item_id: vaultItemId,
       provider_sub: '1234567890',
-      scopes: ['calendar.readonly', 'gmail.readonly'],
+      scopes: [calendarScope, gmailScope],
       expires_at: '2026-11-12T01:00:00.000Z',
     },
   });
@@ -223,20 +254,45 @@ test('OAuth connections keep the credential in the Vault and the metadata in Aut
   assert.equal(connections.length, 1);
   assert.equal(connections[0].provider, 'google');
   assert.equal(connections[0].provider_sub, '1234567890');
-  assert.deepEqual(connections[0].scopes, ['calendar.readonly', 'gmail.readonly']);
+  assert.deepEqual(connections[0].scopes, [calendarScope, gmailScope]);
   assert.equal(connections[0].vault_item_id, vaultItemId);
   // The metadata never carries a credential.
   assert.equal('access_token' in connections[0], false);
   assert.equal('refresh_token' in connections[0], false);
   assert.equal(JSON.stringify(connections).includes('auth-code'), false);
 
-  // A scope the provider never offers is dropped rather than stored.
+  // A completed transaction cannot be reused.
+  const replayedCompletion = await request('/api/connections/google/complete', {
+    cookie,
+    body: { transaction_id: start.transaction_id, state, vault_item_id: vaultItemId, scopes: [calendarScope] },
+  });
+  assert.equal(replayedCompletion.status, 400);
+
+  // A scope the provider never offers is dropped rather than stored. A new
+  // authorization has to be started because completion is one-shot.
+  const secondState = 't'.repeat(43);
+  const secondStart = await (
+    await request('/api/connections/google/start', {
+      cookie,
+      body: { state: secondState, code_challenge: 'c'.repeat(43) },
+    })
+  ).json();
+  const secondCallback = await request(
+    `/api/connections/google/callback?code=auth-code-2&state=${secondState}`,
+    { method: 'GET', cookie },
+  );
+  assert.equal(secondCallback.status, 302);
   await request('/api/connections/google/complete', {
     cookie,
-    body: { vault_item_id: vaultItemId, scopes: ['calendar.readonly', 'not-a-google-scope'] },
+    body: {
+      transaction_id: secondStart.transaction_id,
+      state: secondState,
+      vault_item_id: vaultItemId,
+      scopes: [calendarScope, 'not-a-google-scope'],
+    },
   });
   const rescoped = await (await request('/api/connections', { method: 'GET', cookie })).json();
-  assert.deepEqual(rescoped.connections[0].scopes, ['calendar.readonly']);
+  assert.deepEqual(rescoped.connections[0].scopes, [calendarScope]);
 
   // Deleting the connection revokes the metadata.
   const deleted = await request('/api/connections/google', { method: 'DELETE', cookie });
@@ -310,8 +366,31 @@ test('a server-exchange provider refuses a browser exchange and seals the result
   });
   assert.equal(clientMode.status, 400);
 
+  // A server exchange requires the transaction that produced the code.
+  const state = 'g'.repeat(43);
+  const started = await request('/api/connections/github/start', {
+    cookie,
+    body: { state, code_challenge: 'c'.repeat(43) },
+  });
+  assert.equal(started.status, 200, await started.clone().text());
+  const start = await started.json();
+  const callback = await request(
+    `/api/connections/github/callback?code=auth-code&state=${state}`,
+    { method: 'GET', cookie },
+  );
+  assert.equal(callback.status, 302);
+
+  const noTransaction = await request('/api/connections/github/exchange', {
+    cookie,
+    body: { code: 'auth-code', client_public_key: 'key' },
+  });
+  assert.equal(noTransaction.status, 400);
+
   // The server-exchange route needs a client public key.
-  const noKey = await request('/api/connections/github/exchange', { cookie, body: { code: 'auth-code' } });
+  const noKey = await request('/api/connections/github/exchange', {
+    cookie,
+    body: { transaction_id: start.transaction_id, state, code: 'auth-code' },
+  });
   assert.equal(noKey.status, 400);
 
   // With a key, the result comes back sealed and carries no token.
@@ -319,7 +398,12 @@ test('a server-exchange provider refuses a browser exchange and seals the result
   const publicKey = encode(new Uint8Array(await crypto.subtle.exportKey('spki', keys.publicKey)));
   const exchanged = await request('/api/connections/github/exchange', {
     cookie,
-    body: { code: 'auth-code', client_public_key: publicKey },
+    body: {
+      transaction_id: start.transaction_id,
+      state,
+      code: 'auth-code',
+      client_public_key: publicKey,
+    },
   });
   // GitHub is not reachable from the test environment, so the exchange fails
   // at the provider. The important part is that no token comes back.

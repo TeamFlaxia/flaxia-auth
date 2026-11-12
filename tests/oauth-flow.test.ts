@@ -72,6 +72,8 @@ test('a transaction expires ten minutes after it is created', async () => {
     now,
   });
   assert.equal(transaction.expires_at, '2026-11-12T00:10:00.000Z');
+  assert.equal(transaction.exchanged_at, null);
+  assert.equal(transaction.completed_at, null);
   assert.equal(transactionExpired(transaction, '2026-11-12T00:09:59.000Z'), false);
   assert.equal(transactionExpired(transaction, '2026-11-12T00:10:00.000Z'), true);
   assert.equal(transactionExpired(transaction, '2026-11-12T01:00:00.000Z'), true);
@@ -95,9 +97,16 @@ test('a stored row becomes a usable transaction again', () => {
   assert.equal(transaction.provider, 'discord');
   assert.equal(transaction.consumed_at, null);
 
-  const consumed = transactionFromRow({ ...row, consumed_at: '2026-11-12T00:01:00.000Z' });
+  const consumed = transactionFromRow({
+    ...row,
+    consumed_at: '2026-11-12T00:01:00.000Z',
+    exchanged_at: '2026-11-12T00:02:00.000Z',
+    completed_at: '2026-11-12T00:03:00.000Z',
+  });
   assert.ok(consumed);
   assert.equal(consumed.consumed_at, '2026-11-12T00:01:00.000Z');
+  assert.equal(consumed.exchanged_at, '2026-11-12T00:02:00.000Z');
+  assert.equal(consumed.completed_at, '2026-11-12T00:03:00.000Z');
 
   assert.equal(transactionFromRow({ ...row, provider: 'unknown-provider' }), null);
   assert.equal(transactionFromRow({ ...row, expires_at: 'not-a-date' }), null);

@@ -130,7 +130,15 @@ async function signingKey(db: D1Database): Promise<{ kid: string; key: CryptoKey
   const kid = await sha256url(JSON.stringify(publicJwk));
   await db.prepare('INSERT OR IGNORE INTO oauth_signing_keys (kid, public_jwk, private_jwk, created_at) VALUES (?, ?, ?, ?)')
     .bind(kid, JSON.stringify(publicJwk), JSON.stringify(privateJwk), new Date().toISOString()).run();
-  return { kid, key: pair.privateKey };
+
+  // Two requests may generate a key at the same time. `INSERT OR IGNORE`
+  // leaves the first row in place, so sign with the key that is actually
+  // published instead of the losing in-memory pair. Otherwise the ID token
+  // names a `kid` that JWKS does not contain.
+  const stored = await db.prepare('SELECT kid, private_jwk FROM oauth_signing_keys WHERE kid = ?')
+    .bind(kid).first<{ kid: string; private_jwk: string }>();
+  if (!stored) throw new Error('OAuth signing key could not be initialized');
+  return { kid: stored.kid, key: await importSigningKey(stored.private_jwk) };
 }
 
 async function issueTokens(db: D1Database, client: OAuthClient, user: User, sessionId: string, scope: string, nonce: string | null, withRefresh: boolean): Promise<IssuedTokens> {
@@ -197,6 +205,7 @@ export function createOAuthApp(): Hono<{ Bindings: Env }> {
   const oauth = new Hono<{ Bindings: Env }>();
   oauth.use('/oauth/token', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'Request too large' }, 413) }));
   oauth.use('/oauth/revoke', bodyLimit({ maxSize: 2048, onError: c => c.json({ error: 'Request too large' }, 413) }));
+  oauth.use('/oauth/userinfo', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'Request too large' }, 413) }));
 
   const discovery = {
     issuer: ISSUER,
@@ -435,6 +444,7 @@ export function createOAuthApp(): Hono<{ Bindings: Env }> {
     if (!contentType.toLowerCase().includes('application/x-www-form-urlencoded')) return jsonError(c, 400, 'invalid_request', 'expected application/x-www-form-urlencoded');
     let form: URLSearchParams;
     try { form = new URLSearchParams(await c.req.text()); } catch { return jsonError(c, 400, 'invalid_request', 'invalid body'); }
+    if (await rateLimit(c.env.DB, `oauth-revoke:ip:${requestIp(c)}`, 60)) return jsonError(c, 429, 'rate_limited', 'too many requests');
     const basic = basicAuth(c);
     const clientId = form.get('client_id') ?? basic?.clientId ?? '';
     const clientSecret = form.get('client_secret') ?? basic?.secret ?? '';
@@ -467,6 +477,8 @@ function isValidRedirectUri(uri: string): boolean {
   if (uri.length === 0 || uri.length > 2048 || uri.includes('#')) return false;
   let parsed: URL;
   try { parsed = new URL(uri); } catch { return false; }
+  // Userinfo in a redirect URI is a phishing aid and never needed.
+  if (parsed.username || parsed.password) return false;
   if (parsed.protocol === 'http:' && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')) return true;
   return parsed.protocol === 'https:' && parsed.hostname.length > 0;
 }

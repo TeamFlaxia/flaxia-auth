@@ -20,7 +20,18 @@ curl https://auth.flaxia.app/.well-known/openid-configuration
 | GET | `/oauth/userinfo` | UserInfo |
 | POST | `/oauth/revoke` | トークン失効（RFC 7009） |
 
-OAuth のエンドポイントはブラウザのクロスオリジン Ajax ではなく、トップレベルリダイレクト（認可）とサーバー間通信（トークン・UserInfo・失効）で利用します。CORS は提供しません。
+認可はトップレベルリダイレクトで行います。トークン・UserInfo・失効はサーバー間通信でも利用できますが、パブリックなブラウザクライアントのために CORS も提供します。
+
+| エンドポイント | CORS |
+| --- | --- |
+| `/.well-known/*` | `Access-Control-Allow-Origin: *` |
+| `/oauth/jwks` | `Access-Control-Allow-Origin: *` |
+| `/oauth/token` | 登録済みクライアントの redirect_uri と同じ origin のみ |
+| `/oauth/userinfo` | 同上 |
+| `/oauth/revoke` | 同上 |
+| `/oauth/authorize` | CORS 不要（トップレベル遷移） |
+
+CORS を許可するエンドポイントでは `Vary: Origin` を返し、認証情報（cookie）は許可しません。`Origin` が登録済み redirect_uri の origin と一致しない場合、ブラウザはレスポンスを読めません。
 
 ## クライアント登録
 

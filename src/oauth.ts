@@ -18,6 +18,7 @@ import { bodyLimit } from 'hono/body-limit';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { cookieName, sessionUser, User } from './session';
 import { constantTimeEqual, expiry, random, requestIp, rateLimit, sha256url } from './util';
+import { corsAnyOrigin, corsRegisteredOrigins } from './oauth/cors';
 
 const ISSUER = 'https://auth.flaxia.app';
 const ACCESS_TOKEN_TTL_SECONDS = 3600;
@@ -203,6 +204,11 @@ function jsonError(c: OAuthContext, status: ContentfulStatusCode, error: string,
 
 export function createOAuthApp(): Hono<{ Bindings: Env }> {
   const oauth = new Hono<{ Bindings: Env }>();
+  oauth.use('/.well-known/*', corsAnyOrigin);
+  oauth.use('/oauth/jwks', corsAnyOrigin);
+  oauth.use('/oauth/token', corsRegisteredOrigins);
+  oauth.use('/oauth/userinfo', corsRegisteredOrigins);
+  oauth.use('/oauth/revoke', corsRegisteredOrigins);
   oauth.use('/oauth/token', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'Request too large' }, 413) }));
   oauth.use('/oauth/revoke', bodyLimit({ maxSize: 2048, onError: c => c.json({ error: 'Request too large' }, 413) }));
   oauth.use('/oauth/userinfo', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'Request too large' }, 413) }));

@@ -77,12 +77,48 @@ Vaultの暗号化はすべてブラウザで行います。Authが保存する�
 | POST | `/api/vault/devices/:id/approve` | `{ "approved_pub", "peer_pub", "wrapped_vk" }` で承認 |
 | DELETE | `/api/vault/devices/:id` | 保留中のペアリングのみ取り消し |
 
-アイテムは1アカウント200件、暗号文は1件128KB、合計5MBまでです。`kind` は `post_autosave`、`post_draft`、`private_note`、`personal_setting` のいずれかです。`vk_version` が古い書き込みは409で拒否します。
+アイテムは1アカウント200件、暗号文は1件128KB、合計5MBまでです。`kind` は `post_autosave`、`post_draft`、`private_note`、`personal_setting`、`recommendation_profile`、`mail_identity`、`oauth_connection` のいずれかです。`vk_version` が古い書き込みは409で拒否します。
 
 FlaxiaはService Bindingの `POST /api/flaxia/vault` に `{ "grant", "user_id", "method", "path", "query"?, "body"? }` を送ることで、同じVault APIを利用できます。`current_srp` はグラントに紐づく再認証チャレンジで検証されます。
 
 Flaxia D1に残る移行前のVault行は、初回のVaultアクセス時にFlaxiaが `POST /api/flaxia/vault/import` へ一度だけコピーします。本文は `{ "grant", "user_id", "keys", "devices", "items" }` で、`keys` は封筒、`devices` と `items` は行の配列です。すべてクライアントが生成したラップ済みの値で、サーバーは形状と件数だけを検証します。同じ封筒の再送は `{ "success": true, "imported": false }` を返し、異なる封筒で既存Vaultを置き換えようとすると409 `vault_import_conflict` になります。
 
+## 外部サービスへの OAuth 接続
+
+Flaxia が外部サービス（Google、Microsoft、Discord、Slack、LINE、OpenCode など）の API を呼ぶための接続機能です。**トークンはブラウザだけが保持し、Auth は暗号文しか保存しません。** トークンは Vault の `oauth_connection` アイテムとして保存されるため、他のアイテムと同じ鍵管理・端末失効・パスワード変更時の再ラップがそのまま適用されます。
+
+認可はブラウザが主導します。ブラウザが PKCE の verifier と state を生成して保持し、Auth は state の**ハッシュだけ**を記録します。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| POST | `/api/connections/:provider/start` | 認可URLの発行。`{ "state", "code_challenge", "return_uri"? }` |
+| GET | `/api/connections/:provider/callback` | プロバイダからの戻りを処理し、`return_uri` へ 302 |
+| GET | `/api/connections` | 接続一覧（メタデータのみ） |
+| POST | `/api/connections/:provider/exchange` | 方式S専用。`{ "transaction_id", "state", "code", "client_public_key", "code_verifier"? }` を交換し、結果を seal して返す |
+| POST | `/api/connections/:provider/complete` | `{ "transaction_id", "state", "vault_item_id", "provider_sub"?, "scopes"?, "expires_at"?, "refresh_expires_at"? }` で接続メタデータを記録 |
+| DELETE | `/api/connections/:provider` | 接続を破棄 |
+
+### 2つのモード
+
+プロバイダごとに、トークンエンドポイントがブラウザから呼べるかどうかと client secret が必要かどうかでモードが決まります（2026-11-12 に `Origin: https://flaxia.app` で実測）。
+
+- **方式C（純ブラウザ）**: ブラウザが token endpoint を直接呼び、token をその場で暗号化します。Auth はトークンを見ません。対象は Microsoft、Slack、Discord、Google（Desktop app 型）、OpenAI。
+- **方式S（Server exchange + Seal）**: token endpoint が CORS 対応していない、または client secret が必要なため、Auth が交換し、**クライアント公開鍵で seal して**返します。平文は Auth のメモリに一度だけ存在し、保存はされません。対象は LINE、OpenCode、GitHub、X。
+
+### 流れ
+
+1. ブラウザが `POST /api/connections/:provider/start` に `state` と `code_challenge`（S256）を送ります。Auth は `state` のハッシュを10分間のトランザクションとして保存し、認可URLを返します。PKCE verifier はブラウザが保持し、方式Sでは交換時に Auth へ送ります。
+2. ブラウザが認可URLを開くと、プロバイダが `https://auth.flaxia.app/api/connections/:provider/callback` へ戻します。
+3. callback は state を照合し、Auth のセッションがある場合はトランザクションの `user_id` と一致することを確認してから、トランザクションを**一度だけ消費**します（ネイティブアプリはシステムブラウザを使うため、セッションなしの callback も許可します）。`return_uri` へ `oauth_code` `oauth_state` `oauth_provider` `oauth_transaction` を付けて 302 します。**認可コードは短命な値**であり、PKCE が傍受を防ぎます。
+4. 方式C ならブラウザが token endpoint を直接呼び、token を暗号化して `oauth_connection` アイテムとして保存し、`POST /api/connections/:provider/complete` でメタデータを登録します。方式S なら `POST /api/connections/:provider/exchange` に `transaction_id`・`state`・`code`・`client_public_key` を送り、seal された結果を受け取ります。交換と完了はそれぞれ一度だけ成功し、完了時には Vault アイテムが本人の `oauth_connection` であることを Auth が確認します。
+
+### 制限
+
+- `start` / `exchange` / `complete` は Auth のセッション cookie が必要です（callback はシステムブラウザからの戻りを許すため任意）
+- `state` は43〜128文字、`code_challenge` は43〜128文字、`code_verifier` は43〜128文字の RFC 7636 文字種です
+- `return_uri` は許可リストの完全一致のみです（`https://flaxia.app/settings/connections` ほか開発用）
+- 未知のプロバイダ、期限切れのトランザクション、状態の不一致、セッションの不一致、コードや交換・完了の再利用はいずれも400または302（`oauth_error`）で拒否します
+- 接続一覧はメタデータだけで、トークンや seal 済みの暗号文は含みません
 ## OAuth 2.0 / OpenID Connect
 
 OAuth 2.0 / OpenID Connect のエンドポイントは `/oauth/*` と `/.well-known/*` です。認可コード + PKCE フロー、ID トークン、UserInfo、リフレッシュトークン、失効、ディスカバリ、JWKS を提供します。

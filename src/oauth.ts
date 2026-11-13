@@ -19,6 +19,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { cookieName, sessionUser, User } from './session';
 import { constantTimeEqual, expiry, random, requestIp, rateLimit, sha256url } from './util';
 import { corsAnyOrigin, corsRegisteredOrigins } from './oauth/cors';
+import { detectConsentLanguage, renderConsentPage } from './oauth/consent';
 
 const ISSUER = 'https://auth.flaxia.app';
 const ACCESS_TOKEN_TTL_SECONDS = 3600;
@@ -211,6 +212,7 @@ export function createOAuthApp(): Hono<{ Bindings: Env }> {
   oauth.use('/oauth/revoke', corsRegisteredOrigins);
   oauth.use('/oauth/token', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'Request too large' }, 413) }));
   oauth.use('/oauth/revoke', bodyLimit({ maxSize: 2048, onError: c => c.json({ error: 'Request too large' }, 413) }));
+  oauth.use('/oauth/authorize', bodyLimit({ maxSize: 16 * 1024, onError: c => c.json({ error: 'Request too large' }, 413) }));
   oauth.use('/oauth/userinfo', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'Request too large' }, 413) }));
 
   const discovery = {
@@ -260,6 +262,7 @@ export function createOAuthApp(): Hono<{ Bindings: Env }> {
     const nonce = query.get('nonce') ?? '';
     const challenge = query.get('code_challenge') ?? '';
     const challengeMethod = query.get('code_challenge_method') ?? '';
+    const prompt = query.get('prompt') ?? '';
 
     const invalid = (error: string, description: string) => jsonError(c, 400, error, description);
     const redirectError = (uri: string, error: string, description: string) => {
@@ -302,17 +305,163 @@ export function createOAuthApp(): Hono<{ Bindings: Env }> {
     const user = await sessionUser(c.env.DB, sessionToken);
     if (!user || !sessionToken) return redirectError(redirectUri, 'login_required', 'authentication required');
 
-    const code = random();
-    const now = new Date().toISOString();
-    await c.env.DB.prepare('DELETE FROM oauth_authorization_codes WHERE expires_at <= ?').bind(now).run();
-    await c.env.DB.prepare(`INSERT INTO oauth_authorization_codes
-      (code_hash, client_id, user_id, session_id, redirect_uri, code_challenge, code_challenge_method, scope, state, nonce, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'S256', ?, ?, ?, ?)`)
-      .bind(await sha256url(code), client.client_id, user.id, sessionToken, redirectUri, challenge, scopes.join(' '), state || null, nonce || null, expiry(CODE_TTL_SECONDS * 1000)).run();
+    // Consent is required for every authorization. `prompt=none` cannot show
+    // the page, so a logged-in user has to be told that interaction is needed.
+    if (prompt.split(/\s+/).includes('none')) {
+      return redirectError(redirectUri, 'interaction_required', 'user consent is required');
+    }
 
-    const target = new URL(redirectUri);
+    const now = new Date().toISOString();
+    await c.env.DB.prepare('DELETE FROM oauth_authorization_requests WHERE expires_at <= ?').bind(now).run();
+    await c.env.DB.prepare('DELETE FROM oauth_authorization_codes WHERE expires_at <= ?').bind(now).run();
+
+    const requestId = random();
+    await c.env.DB.prepare(`INSERT INTO oauth_authorization_requests
+      (id, user_id, session_id, client_id, redirect_uri, scope, state, nonce, code_challenge, code_challenge_method, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'S256', ?, ?)`)
+      .bind(
+        requestId,
+        user.id,
+        sessionToken,
+        client.client_id,
+        redirectUri,
+        scopes.join(' '),
+        state || null,
+        nonce || null,
+        challenge,
+        now,
+        expiry(10 * 60 * 1000),
+      ).run();
+
+    const language = detectConsentLanguage(query.get('lang'), c.req.header('Accept-Language'));
+    c.header('Cache-Control', 'no-store');
+    c.header('X-Frame-Options', 'DENY');
+    c.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    c.header('Referrer-Policy', 'no-referrer');
+    return c.html(renderConsentPage({
+      language,
+      clientName: client.client_name || client.client_id,
+      clientId: client.client_id,
+      redirectUri,
+      scopes,
+      username: user.username,
+      displayName: user.display_name,
+      requestId,
+      theme: query.get('theme'),
+    }));
+  });
+
+  oauth.post('/oauth/authorize', async c => {
+    const contentType = c.req.header('Content-Type') ?? '';
+    if (!contentType.toLowerCase().includes('application/x-www-form-urlencoded')) {
+      return jsonError(c, 400, 'invalid_request', 'expected application/x-www-form-urlencoded');
+    }
+
+    // A consent form is same-origin. Reject a cross-site POST even if a
+    // browser omits SameSite protection, and keep the request id unguessable.
+    const origin = c.req.header('Origin');
+    if (origin && origin !== new URL(c.req.url).origin) {
+      return jsonError(c, 403, 'invalid_request', 'cross-origin consent is not allowed');
+    }
+    const site = c.req.header('Sec-Fetch-Site');
+    if (site && site !== 'same-origin' && site !== 'none') {
+      return jsonError(c, 403, 'invalid_request', 'cross-origin consent is not allowed');
+    }
+
+    let form: URLSearchParams;
+    try { form = new URLSearchParams(await c.req.text()); } catch {
+      return jsonError(c, 400, 'invalid_request', 'invalid body');
+    }
+    const requestId = form.get('request_id') ?? '';
+    const decision = form.get('decision') ?? '';
+    if (!/^[A-Za-z0-9_-]{43,128}$/.test(requestId) || (decision !== 'approve' && decision !== 'deny')) {
+      return jsonError(c, 400, 'invalid_request', 'invalid consent request');
+    }
+
+    const sessionToken = getCookie(c, cookieName);
+    const user = await sessionUser(c.env.DB, sessionToken);
+    if (!user || !sessionToken) return jsonError(c, 401, 'login_required', 'authentication required');
+    if (await rateLimit(c.env.DB, `oauth-consent:user:${user.id}`, 60)) {
+      return jsonError(c, 429, 'rate_limited', 'too many requests');
+    }
+
+    const row = await c.env.DB.prepare(`SELECT id, user_id, session_id, client_id, redirect_uri, scope, state, nonce, code_challenge, code_challenge_method, expires_at, consumed_at
+      FROM oauth_authorization_requests WHERE id = ? LIMIT 1`)
+      .bind(requestId)
+      .first<{
+        id: string;
+        user_id: string;
+        session_id: string;
+        client_id: string;
+        redirect_uri: string;
+        scope: string;
+        state: string | null;
+        nonce: string | null;
+        code_challenge: string;
+        code_challenge_method: string;
+        expires_at: string;
+        consumed_at: string | null;
+      }>();
+    const now = new Date().toISOString();
+    if (!row || row.user_id !== user.id || row.session_id !== sessionToken ||
+        row.consumed_at !== null || row.expires_at <= now) {
+      return jsonError(c, 400, 'invalid_request', 'authorization request is invalid or expired');
+    }
+
+    const redirectWithError = (error: string, description: string): Response => {
+      const target = new URL(row.redirect_uri);
+      target.searchParams.set('error', error);
+      target.searchParams.set('error_description', description);
+      if (row.state) target.searchParams.set('state', row.state);
+      c.header('Cache-Control', 'no-store');
+      return c.redirect(target.toString(), 302);
+    };
+
+    const consumed = await c.env.DB.prepare(
+      `UPDATE oauth_authorization_requests SET consumed_at = ?
+       WHERE id = ? AND consumed_at IS NULL AND expires_at > ?`,
+    ).bind(now, row.id, now).run();
+    if (consumed.meta.changes !== 1) {
+      return jsonError(c, 400, 'invalid_request', 'authorization request is invalid or expired');
+    }
+
+    if (decision === 'deny') return redirectWithError('access_denied', 'the user denied the request');
+
+    const client = await clientFor(c.env.DB, row.client_id);
+    if (!client) return redirectWithError('invalid_client', 'the client is no longer available');
+    const scopes = row.scope.split(' ').filter(Boolean);
+    const allowed = parseJsonStringArray(client.allowed_scopes);
+    if (!scopes.includes('openid') || scopes.some(scope => !KNOWN_SCOPES.includes(scope) || !allowed.includes(scope))) {
+      return redirectWithError('invalid_scope', 'the requested scope is no longer allowed');
+    }
+
+    const code = random();
+    try {
+      await c.env.DB.prepare(`INSERT INTO oauth_authorization_codes
+        (code_hash, client_id, user_id, session_id, redirect_uri, code_challenge, code_challenge_method, scope, state, nonce, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'S256', ?, ?, ?, ?)`)
+        .bind(
+          await sha256url(code),
+          client.client_id,
+          user.id,
+          sessionToken,
+          row.redirect_uri,
+          row.code_challenge,
+          row.scope,
+          row.state,
+          row.nonce,
+          expiry(CODE_TTL_SECONDS * 1000),
+        ).run();
+    } catch {
+      // The request was not completed after all; allow the browser to retry.
+      await c.env.DB.prepare('UPDATE oauth_authorization_requests SET consumed_at = NULL WHERE id = ? AND consumed_at = ?')
+        .bind(row.id, now).run();
+      return jsonError(c, 500, 'server_error', 'could not create the authorization code');
+    }
+
+    const target = new URL(row.redirect_uri);
     target.searchParams.set('code', code);
-    if (state) target.searchParams.set('state', state);
+    if (row.state) target.searchParams.set('state', row.state);
     c.header('Cache-Control', 'no-store');
     return c.redirect(target.toString(), 302);
   });

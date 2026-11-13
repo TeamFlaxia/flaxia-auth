@@ -1048,6 +1048,7 @@ export default {
       env.DB.prepare("DELETE FROM device_keys WHERE state = 'pending' AND expires_at <= ?").bind(now),
       env.DB.prepare('DELETE FROM sessions WHERE expires_at <= ?').bind(now),
       env.DB.prepare('DELETE FROM oauth_authorization_codes WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM oauth_authorization_requests WHERE expires_at <= ?').bind(now),
       env.DB.prepare('DELETE FROM oauth_access_tokens WHERE expires_at <= ?').bind(now),
       env.DB.prepare('DELETE FROM oauth_refresh_tokens WHERE expires_at <= ?').bind(now),
     ]);

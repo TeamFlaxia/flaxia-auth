@@ -119,6 +119,21 @@ Flaxia が外部サービス（Google、Microsoft、Discord、Slack、LINE、Ope
 - `return_uri` は許可リストの完全一致のみです（`https://flaxia.app/settings/connections` ほか開発用）
 - 未知のプロバイダ、期限切れのトランザクション、状態の不一致、セッションの不一致、コードや交換・完了の再利用はいずれも400または302（`oauth_error`）で拒否します
 - 接続一覧はメタデータだけで、トークンや seal 済みの暗号文は含みません
+## OAuth 2.0 / OpenID Connect
+
+OAuth 2.0 / OpenID Connect のエンドポイントは `/oauth/*` と `/.well-known/*` です。認可コード + PKCE フロー、ID トークン、UserInfo、リフレッシュトークン、失効、ディスカバリ、JWKS を提供します。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/.well-known/openid-configuration` | OIDCディスカバリ |
+| GET | `/.well-known/oauth-authorization-server` | RFC 8414 メタデータ |
+| GET | `/oauth/jwks` | 公開鍵セット（RS256） |
+| GET | `/oauth/authorize` | 認可エンドポイント |
+| POST | `/oauth/token` | トークンエンドポイント |
+| GET | `/oauth/userinfo` | UserInfo |
+| POST | `/oauth/revoke` | トークン失効 |
+
+詳細は [oauth-oidc.md](oauth-oidc.md) を参照してください。
 
 ## 制限と旧方式
 

@@ -14,21 +14,25 @@ Flaxia向けの認証サービスです。Cloudflare Workers、Hono、TypeScript
 - Authが管理するPersonal Vault（暗号化された鍵、アイテム、端末ペアリング）
 - 外部サービスへのOAuth接続（トークンはブラウザが保持し、Authは暗号文のみ保存）
 - FlaxiaとのService Binding連携（プロビジョニング、セッション交換、グラント失効、パスワード・メール変更、凍結、削除）
-- 期限切れのセッション、認可コード、レガシーフィンガープリント、削除キャンセル、メール変更記録、Vault端末ペアリング、OAuthトランザクションの毎時クリーンアップ
+- OAuth 2.0 / OpenID Connect プロバイダー（認可コード + PKCE、IDトークン、UserInfo、リフレッシュトークン、失効、ディスカバリ、JWKS）
+- 期限切れのセッション、認可コード、レガシーフィンガープリント、削除キャンセル、メール変更記録、Vault端末ペアリング、OAuthコード・トークン・接続トランザクションの毎時クリーンアップ
 
-WebAuthn / パスキー、OIDC / Sign in with Flaxia、SDKは未実装です。
+WebAuthn / パスキー、SDKは未実装です。
 
 ## 構成
 
 ```text
 src/index.ts   認証APIとFlaxia連携エンドポイント
 src/vault.ts   Personal Vaultの保存、検証、端末ペアリング
+src/oauth.ts   OAuth 2.0 / OpenID Connect プロバイダー
 src/oauth/     外部サービスへのOAuth接続（レジストリ、トランザクション、seal、ルート）
+src/session.ts セッションCookieとユーザー解決
+src/util.ts    共有ヘルパー
 src/srp.ts     SRP-6aとKDFの実装
 src/origin.ts  許可するOriginの定義
 migrations/    D1スキーマとマイグレーション
-docs/          API、移行設計、セキュリティレビュー
-tests/         認証・移行・競合・Vault・OAuthのテスト
+docs/          API、OAuth、移行設計、セキュリティレビュー
+tests/         認証・OAuth・接続・移行・競合・Vaultのテスト
 ```
 
 ## 開発
@@ -100,9 +104,23 @@ npx wrangler d1 migrations apply flaxia-auth-prod --remote
 | POST | `/api/connections/:provider/complete` | 接続のメタデータを記録 |
 | DELETE | `/api/connections/:provider` | 接続を破棄 |
 
+OAuth 2.0 / OpenID Connect のエンドポイントは `/oauth/*` と `/.well-known/*` です。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/.well-known/openid-configuration` | OIDCディスカバリ |
+| GET | `/.well-known/oauth-authorization-server` | RFC 8414 メタデータ |
+| GET | `/oauth/jwks` | 公開鍵セット（RS256） |
+| GET | `/oauth/authorize` | 認可エンドポイント（code + PKCE S256） |
+| POST | `/oauth/token` | トークンエンドポイント（`authorization_code` / `refresh_token`） |
+| GET | `/oauth/userinfo` | UserInfo |
+| POST | `/oauth/revoke` | トークン失効（RFC 7009） |
+
+OAuthクライアントの登録・失効と署名鍵のローテーションは、信頼済みの `FlaxiaBridge` Service Binding（`/api/flaxia/oauth/*`）から行います。
+
 Flaxiaからの信頼済みリクエストは、公開ルートではなく `FlaxiaBridge` のService Bindingで受けます。プロビジョニング、セッション交換、グラント失効、認証情報・メール変更、復旧コード登録、削除、凍結などのエンドポイントは `/api/flaxia/*` にあります。Vaultも `/api/flaxia/vault` で同じ保存領域へ委譲でき、Flaxia D1にラップ済み鍵を置く必要はありません。移行前にFlaxia D1へ保存されたVault行は `POST /api/flaxia/vault/import` で一度だけコピーでき、同じ封筒の再送は冪等、異なる封筒は409で拒否します。
 
-SRPの計算と主要な認証フローは[docs/api.md](docs/api.md)を参照してください。
+SRPの計算と主要な認証フローは[docs/api.md](docs/api.md)、OAuth / OIDC のフロー・クレーム・セキュリティは[docs/oauth-oidc.md](docs/oauth-oidc.md)を参照してください。
 
 ## セキュリティと移行
 

@@ -6,6 +6,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, serverStep2 } from './srp';
 import { originAllowed } from './origin';
 import { handleVaultRequest, importVault, validateVaultRewrap } from './vault';
+import { createOAuthApp, createOAuthBridgeApp } from './oauth';
 import { handleComplete, handleDelete, handleExchange, handleList, handleStart, handleCallback } from './oauth/routes';
 import type { ConnectionContext } from './oauth/routes';
 
@@ -706,6 +707,8 @@ bridge.post('/api/flaxia/reauth/verify', bodyLimit({ maxSize: 2048 }), async c =
   return c.json({ valid: await verifyProof(c.env.DB, user, body, 'grant-reauth', body.grant as string) });
 });
 
+bridge.route('/', createOAuthBridgeApp());
+
 export class FlaxiaBridge extends WorkerEntrypoint<Env> {
   async fetch(request: Request): Promise<Response> {
     return bridge.fetch(request, this.env, this.ctx);
@@ -1077,6 +1080,7 @@ app.post('/api/connections/:provider/complete', async c => {
 });
 app.get('/api/connections', c => handleList(connectionContext(c)));
 app.delete('/api/connections/:provider', c => handleDelete(connectionContext(c), c.req.param('provider')));
+app.route('/', createOAuthApp());
 
 export default {
   fetch: app.fetch,
@@ -1090,6 +1094,9 @@ export default {
       env.DB.prepare("DELETE FROM device_keys WHERE state = 'pending' AND expires_at <= ?").bind(now),
       env.DB.prepare('DELETE FROM sessions WHERE expires_at <= ?').bind(now),
       env.DB.prepare('DELETE FROM oauth_transactions WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM oauth_authorization_codes WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM oauth_access_tokens WHERE expires_at <= ?').bind(now),
+      env.DB.prepare('DELETE FROM oauth_refresh_tokens WHERE expires_at <= ?').bind(now),
     ]);
   },
 };

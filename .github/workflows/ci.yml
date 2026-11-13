@@ -51,3 +51,8 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy
+      - name: Verify the production OIDC endpoints
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 10 --retry-delay 3 --retry-all-errors https://auth.flaxia.app/.well-known/openid-configuration | grep -q '"issuer":"https://auth.flaxia.app"'
+          curl -fsS --retry 10 --retry-delay 3 --retry-all-errors https://auth.flaxia.app/oauth/jwks | grep -q '"keys"'

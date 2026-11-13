@@ -83,6 +83,22 @@ FlaxiaはService Bindingの `POST /api/flaxia/vault` に `{ "grant", "user_id", 
 
 Flaxia D1に残る移行前のVault行は、初回のVaultアクセス時にFlaxiaが `POST /api/flaxia/vault/import` へ一度だけコピーします。本文は `{ "grant", "user_id", "keys", "devices", "items" }` で、`keys` は封筒、`devices` と `items` は行の配列です。すべてクライアントが生成したラップ済みの値で、サーバーは形状と件数だけを検証します。同じ封筒の再送は `{ "success": true, "imported": false }` を返し、異なる封筒で既存Vaultを置き換えようとすると409 `vault_import_conflict` になります。
 
+## OAuth 2.0 / OpenID Connect
+
+OAuth 2.0 / OpenID Connect のエンドポイントは `/oauth/*` と `/.well-known/*` です。認可コード + PKCE フロー、ID トークン、UserInfo、リフレッシュトークン、失効、ディスカバリ、JWKS を提供します。
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| GET | `/.well-known/openid-configuration` | OIDCディスカバリ |
+| GET | `/.well-known/oauth-authorization-server` | RFC 8414 メタデータ |
+| GET | `/oauth/jwks` | 公開鍵セット（RS256） |
+| GET | `/oauth/authorize` | 認可エンドポイント |
+| POST | `/oauth/token` | トークンエンドポイント |
+| GET | `/oauth/userinfo` | UserInfo |
+| POST | `/oauth/revoke` | トークン失効 |
+
+詳細は [oauth-oidc.md](oauth-oidc.md) を参照してください。
+
 ## 制限と旧方式
 
 認証APIはリクエスト元IPごとに各パスで毎分20回、SRPログイン開始と旧方式ログインはそれぞれユーザーごとに毎分5回までです。超過時は429を返します。

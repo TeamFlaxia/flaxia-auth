@@ -1,0 +1,8 @@
+{
+  "name": "flaxia-auth-oauth-bridge-test-proxy",
+  "main": "bridge-proxy.ts",
+  "compatibility_date": "2026-10-28",
+  "services": [
+    { "binding": "AUTH_SERVICE", "service": "flaxia-auth-oauth-test", "entrypoint": "FlaxiaBridge" }
+  ]
+}

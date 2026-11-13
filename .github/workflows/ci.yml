@@ -54,5 +54,6 @@ jobs:
       - name: Verify the production OIDC endpoints
         run: |
           set -euo pipefail
-          curl -fsS --retry 10 --retry-delay 3 --retry-all-errors https://auth.flaxia.app/.well-known/openid-configuration | grep -q '"issuer":"https://auth.flaxia.app"'
-          curl -fsS --retry 10 --retry-delay 3 --retry-all-errors https://auth.flaxia.app/oauth/jwks | grep -q '"keys"'
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+          curl -fsS -A "$ua" -H 'Accept: application/json' --retry 10 --retry-delay 3 --retry-all-errors https://auth.flaxia.app/.well-known/openid-configuration | grep -q '"issuer":"https://auth.flaxia.app"'
+          curl -fsS -A "$ua" -H 'Accept: application/json' --retry 10 --retry-delay 3 --retry-all-errors https://auth.flaxia.app/oauth/jwks | grep -q '"keys"'

@@ -77,9 +77,11 @@ Content-Type: application/json
 
    `openid` スコープは必須です。PKCE は全クライアントで必須です（`plain` は非対応）。ユーザーが Auth のセッションを持たない場合は、`error=login_required` を redirect_uri に返します。
 
-2. 成功すると `code` と `state` を redirect_uri にリダイレクトします。
+2. セッションがある場合、Auth はクライアント名・redirect 先・要求スコープを表示する同意画面を返します。ユーザーが「許可」すると `POST /oauth/authorize` に `request_id` と `decision=approve` が送られ、トランザクションを一度だけ消費して `code` と `state` を redirect_uri に返します。「拒否」の場合は `error=access_denied` を返します。`prompt=none` で同意が必要な場合は `error=interaction_required` を返します。
 
-3. RP はトークンエンドポイントでコードを交換します。
+3. 認可コードは60秒で失効し、一度だけ使用できます。
+
+4. RP はトークンエンドポイントでコードを交換します。
 
    ```http
    POST /oauth/token
@@ -160,6 +162,7 @@ ID トークンは RS256 の JWT です。`GET /oauth/jwks` の公開鍵で検�
 | `unsupported_response_type` | `response_type=code` 以外 |
 | `invalid_scope` | スコープが未対応またはクライアントに未許可 |
 | `login_required` | セッションが必要 |
+| `interaction_required` | 同意画面の表示が必要（`prompt=none`） |
 | `invalid_grant` | コード・リフレッシュトークンが無効または失効 |
 | `invalid_token` | アクセストークンが無効または失効 |
 | `insufficient_scope` | 必要なスコープが不足 |
@@ -178,12 +181,14 @@ ID トークンは RS256 の JWT です。`GET /oauth/jwks` の公開鍵で検�
 - リフレッシュトークンはローテーションし、再使用を検知した場合はファミリーを失効します。
 - 認可・トークン・UserInfo には IP ごとのレート制限を適用します。
 - 署名秘密鍵は D1 に保存します。D1 は Cloudflare により保存時に暗号化されますが、DB への読み取りアクセスを持つ者による署名が可能になる点に注意してください。
-- 同意画面は未提供です。クライアント登録は信頼済みの Flaxia Service Binding に限定されているため、第一者クライアント向けのフェーズ1としています。
+- 同意画面は毎回表示し、同意の記憶は行いません。`request_id` は256bitランダムで、Authセッションとクライアントに束縛し、一度だけ消費します。
+- 同意画面のPOSTは同一オリジンからのみ受け付けます。
 
 ## 未実装
 
 - 動的クライアント登録（RFC 7591）と管理 UI
 - トークンイントロスペクション（RFC 7662）
-- `max_age` / `acr` / `prompt=consent` / 同意画面
+- `max_age` / `acr` / `prompt=login`
+- 同意の記憶とクライアント管理画面
 - OpenID Connect RP-Initiated Logout
 - クレームのマッピング設定

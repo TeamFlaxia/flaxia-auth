@@ -69,6 +69,17 @@ test('OAuth 2.0 / OpenID Connect provider', { timeout: 90000 }, async t => {
       'Access-Control-Request-Headers': 'content-type',
     },
   });
+  const consentPost = (requestId, decision = 'approve', headers = {}) => fetch(`${base}/oauth/authorize`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'CF-Connecting-IP': ip,
+      cookie,
+      ...headers,
+    },
+    body: new URLSearchParams({ request_id: requestId, decision }).toString(),
+    redirect: 'manual',
+  });
   const bridgePost = (path, body) => fetch(`${bridgeBase}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const query = sql => {
     const result = spawnSync(process.execPath, [wrangler, 'd1', 'execute', 'flaxia-auth-prod', '--local', '--persist-to', directory, '--command', sql], { encoding: 'utf8', env: { ...process.env, CI: 'true' } });
@@ -85,6 +96,8 @@ test('OAuth 2.0 / OpenID Connect provider', { timeout: 90000 }, async t => {
       sessionCookie = cookie,
       challengeMethod = 'S256',
       prompt,
+      decision = 'approve',
+      autoApprove = true,
     } = options;
     const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
     const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
@@ -99,8 +112,27 @@ test('OAuth 2.0 / OpenID Connect provider', { timeout: 90000 }, async t => {
       code_challenge_method: challengeMethod,
     });
     if (prompt) params.set('prompt', prompt);
-    const response = await get(`/oauth/authorize?${params}`, sessionCookie ? { cookie: sessionCookie } : {});
-    return { response, verifier, challenge };
+    const consent = await get(`/oauth/authorize?${params}`, sessionCookie ? { cookie: sessionCookie } : {});
+    if (consent.status !== 200) {
+      return { response: consent, verifier, challenge, consent };
+    }
+    const consentHtml = await consent.text();
+    const requestId = consentHtml.match(/name="request_id" value="([^"]+)"/)?.[1];
+    if (!requestId) throw new Error('consent page did not include a request id');
+    if (!autoApprove) {
+      return { response: consent, verifier, challenge, consent, consentHtml, requestId };
+    }
+    const response = await fetch(`${base}/oauth/authorize`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'CF-Connecting-IP': ip,
+        ...(sessionCookie ? { cookie: sessionCookie } : {}),
+      },
+      body: new URLSearchParams({ request_id: requestId, decision }).toString(),
+      redirect: 'manual',
+    });
+    return { response, verifier, challenge, consent, consentHtml, requestId };
   }
 
   const redirectOf = response => new URL(response.headers.get('location'));
@@ -168,6 +200,38 @@ test('OAuth 2.0 / OpenID Connect provider', { timeout: 90000 }, async t => {
   assert.deepEqual(metadata.code_challenge_methods_supported, ['S256']);
   assert.equal(metadata.id_token_signing_alg_values_supported[0], 'RS256');
   assert.equal((await get('/.well-known/oauth-authorization-server')).status, 200);
+
+  // ── Consent screen ────────────────────────────────────────────────────────
+  const consent = await authorize({ autoApprove: false, state: 'consent-screen' });
+  assert.equal(consent.response.status, 200);
+  assert.match(consent.consentHtml, /Test Client/);
+  assert.match(consent.consentHtml, /Verify your identity|本人確認/);
+  assert.match(consent.requestId, /^[A-Za-z0-9_-]{43}$/);
+
+  const denied = await authorize({ decision: 'deny', state: 'deny-state' });
+  assert.equal(denied.response.status, 302);
+  assert.equal(redirectOf(denied.response).searchParams.get('error'), 'access_denied');
+  assert.equal(redirectOf(denied.response).searchParams.get('state'), 'deny-state');
+
+  // A cross-origin consent POST is rejected before the request is consumed.
+  const crossOrigin = await consentPost(consent.requestId, 'approve', { Origin: 'https://evil.example' });
+  assert.equal(crossOrigin.status, 403);
+  // The same request can still be approved by the browser that owns it.
+  const approvedAfterCrossOrigin = await consentPost(consent.requestId, 'approve');
+  assert.equal(approvedAfterCrossOrigin.status, 302);
+  assert.match(redirectOf(approvedAfterCrossOrigin).searchParams.get('code') ?? '', /^[A-Za-z0-9_-]{43}$/);
+
+  // A consent request is single-use.
+  const replayConsent = await authorize({ autoApprove: false, state: 'replay-consent' });
+  const firstApproval = await consentPost(replayConsent.requestId, 'approve');
+  assert.equal(firstApproval.status, 302);
+  const secondApproval = await consentPost(replayConsent.requestId, 'approve');
+  assert.equal(secondApproval.status, 400);
+
+  // prompt=none cannot show a consent page and must ask for interaction.
+  const promptNone = await authorize({ prompt: 'none', state: 'prompt-none' });
+  assert.equal(promptNone.response.status, 302);
+  assert.equal(redirectOf(promptNone.response).searchParams.get('error'), 'interaction_required');
 
   // ── Authorization code + PKCE ─────────────────────────────────────────────
   const auth = await authorize();

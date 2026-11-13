@@ -60,6 +60,15 @@ test('OAuth 2.0 / OpenID Connect provider', { timeout: 90000 }, async t => {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': ip, ...headers },
     body: new URLSearchParams(fields).toString(),
   });
+  const preflight = (path, origin) => fetch(`${base}${path}`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: origin,
+      'CF-Connecting-IP': ip,
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'content-type',
+    },
+  });
   const bridgePost = (path, body) => fetch(`${bridgeBase}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const query = sql => {
     const result = spawnSync(process.execPath, [wrangler, 'd1', 'execute', 'flaxia-auth-prod', '--local', '--persist-to', directory, '--command', sql], { encoding: 'utf8', env: { ...process.env, CI: 'true' } });
@@ -127,6 +136,24 @@ test('OAuth 2.0 / OpenID Connect provider', { timeout: 90000 }, async t => {
   assert.equal(publicClient.is_confidential, false);
   assert.equal('client_secret' in publicClient, false);
 
+  // ── CORS ─────────────────────────────────────────────────────────────────
+  // A registered redirect URI origin may call the token endpoint from a
+  // browser. An unknown origin gets no CORS permission.
+  const allowedPreflight = await preflight('/oauth/token', 'https://client.example');
+  assert.equal(allowedPreflight.status, 204);
+  assert.equal(allowedPreflight.headers.get('access-control-allow-origin'), 'https://client.example');
+  assert.equal(allowedPreflight.headers.get('access-control-allow-credentials'), null);
+  assert.match(allowedPreflight.headers.get('access-control-allow-methods') ?? '', /POST/);
+  assert.match(allowedPreflight.headers.get('access-control-allow-headers') ?? '', /Authorization/);
+  assert.equal((allowedPreflight.headers.get('vary') ?? '').toLowerCase(), 'origin');
+  const unknownPreflight = await preflight('/oauth/token', 'https://evil.example');
+  assert.equal(unknownPreflight.status, 204);
+  assert.equal(unknownPreflight.headers.get('access-control-allow-origin'), null);
+  const discoveryCors = await get('/.well-known/openid-configuration', { Origin: 'https://any.example' });
+  assert.equal(discoveryCors.headers.get('access-control-allow-origin'), '*');
+  const jwksCors = await get('/oauth/jwks', { Origin: 'https://any.example' });
+  assert.equal(jwksCors.headers.get('access-control-allow-origin'), '*');
+
   // ── Discovery and JWKS ────────────────────────────────────────────────────
   const discoveryResponse = await get('/.well-known/openid-configuration');
   assert.equal(discoveryResponse.status, 200);
@@ -159,8 +186,9 @@ test('OAuth 2.0 / OpenID Connect provider', { timeout: 90000 }, async t => {
     client_id: 'test-client',
     client_secret: confidentialClient.client_secret,
     code_verifier: auth.verifier,
-  });
+  }, { Origin: 'https://client.example' });
   assert.equal(tokenResponse.status, 200);
+  assert.equal(tokenResponse.headers.get('access-control-allow-origin'), 'https://client.example');
   assert.equal(tokenResponse.headers.get('cache-control'), 'no-store');
   const tokens = await tokenResponse.json();
   assert.equal(tokens.token_type, 'Bearer');
@@ -195,8 +223,12 @@ test('OAuth 2.0 / OpenID Connect provider', { timeout: 90000 }, async t => {
   assert.equal(await crypto.subtle.verify('RSASSA-PKCS1-v1_5', verifyKey, Buffer.from(idParts[2], 'base64url'), new TextEncoder().encode(`${idParts[0]}.${idParts[1]}`)), true);
 
   // ── UserInfo ──────────────────────────────────────────────────────────────
-  const userinfoResponse = await get('/oauth/userinfo', { Authorization: `Bearer ${tokens.access_token}` });
+  const userinfoResponse = await get('/oauth/userinfo', {
+    Authorization: `Bearer ${tokens.access_token}`,
+    Origin: 'https://client.example',
+  });
   assert.equal(userinfoResponse.status, 200);
+  assert.equal(userinfoResponse.headers.get('access-control-allow-origin'), 'https://client.example');
   const claims = await userinfoResponse.json();
   assert.equal(claims.sub, 'oauth-user');
   assert.equal(claims.preferred_username, 'OAuthUser');

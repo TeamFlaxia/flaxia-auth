@@ -67,6 +67,9 @@ const VAULT_ITEM_KINDS = new Set([
   'personal_setting',
   'recommendation_profile',
   'mail_identity',
+  // An OAuth connection credential. The token is encrypted here like every
+  // other item, so Auth holds ciphertext it cannot read.
+  'oauth_connection',
 ]);
 const DEFAULT_PAIRING_TTL_SECONDS = 600;
 const NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";

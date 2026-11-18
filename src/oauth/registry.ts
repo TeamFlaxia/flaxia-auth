@@ -43,6 +43,8 @@ export interface OAuthProvider {
   requiresClientSecret: boolean;
   /** Device authorization endpoint (RFC 8628), for `mode: 'device'`. */
   deviceCodeUrl?: string;
+  /** Extra fields for the device authorization request. */
+  deviceCodeParams?: Record<string, string | boolean>;
   /** User-Agent the provider expects on its device endpoints. */
   deviceUserAgent?: string;
   /**
@@ -143,6 +145,9 @@ const PROVIDERS: Record<string, OAuthProvider> = {
     scopes: ['inference'],
     requiresClientSecret: false,
     publicClientId: 'opencode-cli',
+    // Without org scoping the grant is bound to the first workspace by name,
+    // not the one the user approves in the Console.
+    deviceCodeParams: { supports_org_scope: true },
     deviceUserAgent: 'opencode/cli',
   },
   github: {

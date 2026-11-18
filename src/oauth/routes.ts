@@ -499,7 +499,7 @@ export async function handleDeviceStart(
         Accept: 'application/json',
         ...(definition.deviceUserAgent ? { 'User-Agent': definition.deviceUserAgent } : {}),
       },
-      body: JSON.stringify({ client_id: clientId }),
+      body: JSON.stringify({ client_id: clientId, ...definition.deviceCodeParams }),
     });
   } catch {
     return ctx.json({ error: 'Provider is unreachable' }, 502);
@@ -513,14 +513,17 @@ export async function handleDeviceStart(
   if (!deviceCode || !userCode) {
     return ctx.json({ error: 'Provider returned an invalid response' }, 502);
   }
+  // Relative verification URIs resolve against the Console origin, not the
+  // device endpoint path, so `device?user_code=…` does not land under /auth/.
+  const consoleBase = new URL('/', endpoints.code).toString();
   const verificationUriRaw =
-    resolveHttpsUrl(boundedString(grant.verification_uri, 2048) ?? definition.authorizeUrl, endpoints.code) ??
+    resolveHttpsUrl(boundedString(grant.verification_uri, 2048) ?? definition.authorizeUrl, consoleBase) ??
     definition.authorizeUrl;
   if (!isHttpsUrl(verificationUriRaw)) {
     return ctx.json({ error: 'Provider returned an invalid response' }, 502);
   }
   const completeRaw = boundedString(grant.verification_uri_complete, 2048);
-  const verificationUriComplete = completeRaw ? resolveHttpsUrl(completeRaw, endpoints.code) : null;
+  const verificationUriComplete = completeRaw ? resolveHttpsUrl(completeRaw, consoleBase) : null;
   const expiresIn = typeof grant.expires_in === 'number' && Number.isInteger(grant.expires_in) &&
       grant.expires_in >= 1 && grant.expires_in <= 3600
     ? grant.expires_in
@@ -600,6 +603,12 @@ export async function handleDevicePoll(
   if (!transactionId || !isValidState(state) || !deviceCode || !clientPublicKey) {
     return ctx.json({ error: 'Invalid request' }, 400);
   }
+  // The interval the browser is currently polling at, so `slow_down` can add
+  // 5 seconds to it as RFC 8628 requires. Defaults to the RFC's 5 seconds.
+  const pollInterval = typeof body.interval === 'number' && Number.isInteger(body.interval) &&
+      body.interval >= 1 && body.interval <= 60
+    ? body.interval
+    : 5;
 
   const row = await ctx.env.DB.prepare(
     `SELECT id, user_id, provider, state_hash, code_verifier_hash, redirect_uri, return_uri, expires_at, consumed_at, exchanged_at, completed_at
@@ -646,7 +655,7 @@ export async function handleDevicePoll(
   const error = typeof token.error === 'string' ? token.error : null;
   if (error) {
     if (error === 'authorization_pending') return ctx.json({ status: 'pending' });
-    if (error === 'slow_down') return ctx.json({ status: 'slow_down', interval: 10 });
+    if (error === 'slow_down') return ctx.json({ status: 'slow_down', interval: Math.min(60, pollInterval + 5) });
     if (error === 'access_denied') return ctx.json({ status: 'access_denied' }, 403);
     if (error === 'expired_token') return ctx.json({ status: 'expired' }, 400);
     return ctx.json({ error: 'Provider rejected the device authorization' }, 502);

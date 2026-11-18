@@ -119,11 +119,12 @@ OpenCode の Console は認可コードフローを提供せず、トークン�
 | Method | Path | 用途 |
 | --- | --- | --- |
 | POST | `/api/connections/opencode/device/start` | `{ "state" }` → `transaction_id`, `device_code`, `user_code`, 検証URL, `interval` |
-| POST | `/api/connections/opencode/device/poll` | `{ "transaction_id", "state", "device_code", "client_public_key" }` → `{ "status": "pending" }` または `{ "status": "complete", "sealed", "orgs" }` |
+| POST | `/api/connections/opencode/device/poll` | `{ "transaction_id", "state", "device_code", "client_public_key", "interval"? }` → `{ "status": "pending" }`、`{ "status": "slow_down", "interval" }`、または `{ "status": "complete", "sealed", "orgs" }` |
 | POST | `/api/connections/opencode/device/refresh` | `{ "refresh_token", "client_public_key" }` → `{ "sealed" }` |
 
 - `start` と `poll` は Auth のセッション cookie が必要です。
-- `poll` は `authorization_pending` / `slow_down` を正常応答（`status`）として返し、`access_denied` / `expired_token` は拒否します。
+- `poll` は `authorization_pending` / `slow_down` を正常応答（`status`）として返し、`access_denied` / `expired_token` は拒否します。`slow_down` の `interval` は、要求の `interval`（省略時 5 秒、1〜60 の整数）に 5 秒を足した値です。
+- `start` は device authorization の要求に `supports_org_scope: true` を付けます。これにより Console の承認画面で選んだワークスペースに grant が結び付きます。
 - 成功時の `sealed` はトークンエンドポイントの生レスポンスをクライアント公開鍵で封緘したものです。`orgs` は Console のワークスペース一覧（秘密ではないメタデータ）で、seal の外に置きます。
 - `refresh` は Vault から復号したリフレッシュトークンをその場で交換するための経路です。Auth は平文をメモリ上で一度だけ扱い、保存しません。
 - `complete` は他の方式と同じく `transaction_id` / `state` / `vault_item_id` を受け取り、Vault の `oauth_connection` アイテムと接続メタデータを結び付けます。

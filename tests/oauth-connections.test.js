@@ -429,8 +429,10 @@ test('the OpenCode device flow polls on the server and seals the tokens', { time
   );
   assert.equal(migration.status, 0, migration.stdout + migration.stderr);
 
-  // A fake Console: the first poll is pending, the second issues a token.
+  // A fake Console: the first poll asks to slow down, the second is pending,
+  // the third issues a token.
   let polls = 0;
+  let codeRequest = null;
   const consoleServer = createHttpServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
@@ -439,6 +441,7 @@ test('the OpenCode device flow polls on the server and seals the tokens', { time
       res.end(JSON.stringify(body));
     };
     if (req.method === 'POST' && req.url === '/auth/device/code') {
+      codeRequest = { body: JSON.parse(raw), userAgent: req.headers['user-agent'] };
       json(200, {
         device_code: 'device-code-123',
         user_code: 'ABCD-EFGH',
@@ -463,6 +466,10 @@ test('the OpenCode device flow polls on the server and seals the tokens', { time
       }
       polls += 1;
       if (polls === 1) {
+        json(400, { error: 'slow_down' });
+        return;
+      }
+      if (polls === 2) {
         json(400, { error: 'authorization_pending' });
         return;
       }
@@ -575,6 +582,22 @@ test('the OpenCode device flow polls on the server and seals the tokens', { time
   assert.equal(start.interval, 1);
   assert.equal('access_token' in start, false);
   assert.equal(JSON.stringify(start).includes('oc_access'), false);
+  assert.deepEqual(codeRequest.body, { client_id: 'opencode-cli', supports_org_scope: true });
+  assert.equal(codeRequest.userAgent, 'opencode/cli');
+
+  // slow_down raises the interval the browser reported by 5 seconds.
+  const slowed = await request('/api/connections/opencode/device/poll', {
+    cookie,
+    body: {
+      transaction_id: start.transaction_id,
+      state,
+      device_code: start.device_code,
+      client_public_key: 'not-a-key-yet',
+      interval: 1,
+    },
+  });
+  assert.equal(slowed.status, 200, await slowed.clone().text());
+  assert.deepEqual(await slowed.json(), { status: 'slow_down', interval: 6 });
 
   // Pending is a normal answer, not an error.
   const pending = await request('/api/connections/opencode/device/poll', {

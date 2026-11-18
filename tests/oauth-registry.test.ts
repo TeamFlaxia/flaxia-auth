@@ -55,9 +55,9 @@ test('device-flow providers use RFC 8628 instead of a redirect', () => {
   assert.deepEqual(device.sort(), ['opencode']);
   for (const id of device) {
     const provider = getProvider(id)!;
-    assert.ok(provider.deviceCodeUrl, id);
+    assert.ok(provider.deviceServer, id);
     assert.deepEqual(provider.deviceCodeParams, { supports_org_scope: true }, id);
-    assert.equal(new URL(provider.deviceCodeUrl!).protocol, 'https:', id);
+    assert.equal(new URL(provider.deviceServer!).protocol, 'https:', id);
     assert.equal(provider.requiresClientSecret, false, id);
     assert.ok(provider.publicClientId || provider.clientIdEnv, id);
   }

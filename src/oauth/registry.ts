@@ -41,8 +41,8 @@ export interface OAuthProvider {
   scopeSeparator?: string;
   /** Whether the flow requires a client secret the browser cannot hold. */
   requiresClientSecret: boolean;
-  /** Device authorization endpoint (RFC 8628), for `mode: 'device'`. */
-  deviceCodeUrl?: string;
+  /** Console server root (e.g. https://opencode.ai/console), for `mode: 'device'`. */
+  deviceServer?: string;
   /** Extra fields for the device authorization request. */
   deviceCodeParams?: Record<string, string | boolean>;
   /** User-Agent the provider expects on its device endpoints. */
@@ -140,7 +140,7 @@ const PROVIDERS: Record<string, OAuthProvider> = {
     // token. Auth polls instead and seals the result. The device grant has
     // no callback: this URL is only the human verification page.
     authorizeUrl: 'https://opencode.ai/console/device',
-    deviceCodeUrl: 'https://opencode.ai/console/auth/device/code',
+    deviceServer: 'https://opencode.ai/console',
     tokenUrl: 'https://opencode.ai/console/auth/device/token',
     scopes: ['inference'],
     requiresClientSecret: false,

@@ -67,6 +67,7 @@ const callbackUri = (provider: string): string => `${AUTH_ORIGIN}${CALLBACK_PATH
 const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 
 interface DeviceEndpoints {
+  server: string;
   code: string;
   token: string;
   orgs: string;
@@ -75,23 +76,20 @@ interface DeviceEndpoints {
 /**
  * The device endpoints for a provider. `OPENCODE_CONSOLE_ORIGIN` exists for
  * integration tests (and self-hosted consoles); production never sets it.
+ * Every path is relative to the Console root, as in the OpenCode client.
  */
 const deviceEndpoints = (env: ConnectionEnv, definition: OAuthProvider): DeviceEndpoints | null => {
-  if (definition.mode !== 'device' || !definition.deviceCodeUrl) return null;
+  if (definition.mode !== 'device' || !definition.deviceServer) return null;
   const override = definition.id === 'opencode' && typeof env.OPENCODE_CONSOLE_ORIGIN === 'string'
-    ? env.OPENCODE_CONSOLE_ORIGIN.replace(/\/+$/, '')
+    ? env.OPENCODE_CONSOLE_ORIGIN
     : null;
-  if (override) {
-    return {
-      code: `${override}/auth/device/code`,
-      token: `${override}/auth/device/token`,
-      orgs: `${override}/api/orgs`,
-    };
-  }
+  const server = (override ?? definition.deviceServer).replace(/\/+$/, '');
+  if (!server) return null;
   return {
-    code: definition.deviceCodeUrl,
-    token: definition.tokenUrl,
-    orgs: new URL('/console/api/orgs', definition.deviceCodeUrl).toString(),
+    server,
+    code: `${server}/auth/device/code`,
+    token: `${server}/auth/device/token`,
+    orgs: `${server}/api/orgs`,
   };
 };
 
@@ -513,9 +511,9 @@ export async function handleDeviceStart(
   if (!deviceCode || !userCode) {
     return ctx.json({ error: 'Provider returned an invalid response' }, 502);
   }
-  // Relative verification URIs resolve against the Console origin, not the
+  // Relative verification URIs resolve against the Console root, not the
   // device endpoint path, so `device?user_code=…` does not land under /auth/.
-  const consoleBase = new URL('/', endpoints.code).toString();
+  const consoleBase = `${endpoints.server}/`;
   const verificationUriRaw =
     resolveHttpsUrl(boundedString(grant.verification_uri, 2048) ?? definition.authorizeUrl, consoleBase) ??
     definition.authorizeUrl;

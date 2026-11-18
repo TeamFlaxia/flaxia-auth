@@ -112,11 +112,27 @@ Flaxia が外部サービス（Google、Microsoft、Discord、Slack、LINE、Ope
 3. callback は state を照合し、Auth のセッションがある場合はトランザクションの `user_id` と一致することを確認してから、トランザクションを**一度だけ消費**します（ネイティブアプリはシステムブラウザを使うため、セッションなしの callback も許可します）。`return_uri` へ `oauth_code` `oauth_state` `oauth_provider` `oauth_transaction` を付けて 302 します。**認可コードは短命な値**であり、PKCE が傍受を防ぎます。
 4. 方式C ならブラウザが token endpoint を直接呼び、token を暗号化して `oauth_connection` アイテムとして保存し、`POST /api/connections/:provider/complete` でメタデータを登録します。方式S なら `POST /api/connections/:provider/exchange` に `transaction_id`・`state`・`code`・`client_public_key` を送り、seal された結果を受け取ります。交換と完了はそれぞれ一度だけ成功し、完了時には Vault アイテムが本人の `oauth_connection` であることを Auth が確認します。
 
+### デバイスフロー（OpenCode）
+
+OpenCode の Console は認可コードフローを提供せず、トークンエンドポイントもブラウザから呼べません（CORS は `https://opencode.ai` 固定）。そのため RFC 8628 のデバイス認可を使い、Auth がポーリングと交換を行います。**デバイスコードはブラウザが保持し、Auth は保存しません。トークンも seal して返すだけで、D1 には残しません。**
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| POST | `/api/connections/opencode/device/start` | `{ "state" }` → `transaction_id`, `device_code`, `user_code`, 検証URL, `interval` |
+| POST | `/api/connections/opencode/device/poll` | `{ "transaction_id", "state", "device_code", "client_public_key" }` → `{ "status": "pending" }` または `{ "status": "complete", "sealed", "orgs" }` |
+| POST | `/api/connections/opencode/device/refresh` | `{ "refresh_token", "client_public_key" }` → `{ "sealed" }` |
+
+- `start` と `poll` は Auth のセッション cookie が必要です。
+- `poll` は `authorization_pending` / `slow_down` を正常応答（`status`）として返し、`access_denied` / `expired_token` は拒否します。
+- 成功時の `sealed` はトークンエンドポイントの生レスポンスをクライアント公開鍵で封緘したものです。`orgs` は Console のワークスペース一覧（秘密ではないメタデータ）で、seal の外に置きます。
+- `refresh` は Vault から復号したリフレッシュトークンをその場で交換するための経路です。Auth は平文をメモリ上で一度だけ扱い、保存しません。
+- `complete` は他の方式と同じく `transaction_id` / `state` / `vault_item_id` を受け取り、Vault の `oauth_connection` アイテムと接続メタデータを結び付けます。
+
 ### 制限
 
-- `start` / `exchange` / `complete` は Auth のセッション cookie が必要です（callback はシステムブラウザからの戻りを許すため任意）
+- `start` / `exchange` / `device/*` / `complete` は Auth のセッション cookie が必要です（callback はシステムブラウザからの戻りを許すため任意）
 - `state` は43〜128文字、`code_challenge` は43〜128文字、`code_verifier` は43〜128文字の RFC 7636 文字種です
-- `return_uri` は許可リストの完全一致のみです（`https://flaxia.app/settings/connections` ほか開発用）
+- `return_uri` は許可リストの完全一致のみです（`https://flaxia.app/settings/connections`、`https://studio.flaxia.app/` ほか開発用）
 - 未知のプロバイダ、期限切れのトランザクション、状態の不一致、セッションの不一致、コードや交換・完了の再利用はいずれも400または302（`oauth_error`）で拒否します
 - 接続一覧はメタデータだけで、トークンや seal 済みの暗号文は含みません
 ## OAuth 2.0 / OpenID Connect

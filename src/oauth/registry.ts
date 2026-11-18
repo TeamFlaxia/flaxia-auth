@@ -13,15 +13,21 @@
 //                   performs the exchange and hands the result back sealed
 //                   to a client public key, so the plaintext is never stored.
 //
+//   device          The provider only implements the OAuth 2.0 device
+//                   authorization grant (RFC 8628). Auth starts the device
+//                   authorization and polls the token endpoint; the browser
+//                   shows the user code and keeps the device code. The result
+//                   is sealed exactly like a server_exchange result.
+//
 // The CORS behaviour was measured on 2026-11-12 against
 // `Origin: https://flaxia.app`. Do not change a mode without re-measuring:
 //   microsoft  ACAO: *            slack    ACAO: *
 //   discord    ACAO: <origin>     google   ACAO: <origin>
 //   line       ACAO: *            openai   ACAO: *
 //   github     no CORS header     x        no CORS header
-//   opencode   ACAO: https://opencode.ai (fixed)
+//   opencode   ACAO: https://opencode.ai (fixed), and only a device flow
 
-export type OAuthMode = 'client' | 'server_exchange';
+export type OAuthMode = 'client' | 'server_exchange' | 'device';
 
 export interface OAuthProvider {
   id: string;
@@ -35,6 +41,10 @@ export interface OAuthProvider {
   scopeSeparator?: string;
   /** Whether the flow requires a client secret the browser cannot hold. */
   requiresClientSecret: boolean;
+  /** Device authorization endpoint (RFC 8628), for `mode: 'device'`. */
+  deviceCodeUrl?: string;
+  /** User-Agent the provider expects on its device endpoints. */
+  deviceUserAgent?: string;
   /**
    * A well-known public client id, for providers whose client is not
    * registered per deployment (the OpenCode device flow is public).
@@ -122,15 +132,18 @@ const PROVIDERS: Record<string, OAuthProvider> = {
   opencode: {
     id: 'opencode',
     label: 'OpenCode',
-    mode: 'server_exchange',
-    authorizeUrl: 'https://console.opencode.ai/console/device',
-    tokenUrl: 'https://console.opencode.ai/auth/device/token',
+    mode: 'device',
+    // The Console answers with a fixed `Access-Control-Allow-Origin:
+    // https://opencode.ai`, so a browser on our origin cannot poll for the
+    // token. Auth polls instead and seals the result. The device grant has
+    // no callback: this URL is only the human verification page.
+    authorizeUrl: 'https://opencode.ai/console/device',
+    deviceCodeUrl: 'https://opencode.ai/console/auth/device/code',
+    tokenUrl: 'https://opencode.ai/console/auth/device/token',
     scopes: ['inference'],
-    // The device flow is a public client, but the Console answers with a
-    // fixed `Access-Control-Allow-Origin: https://opencode.ai`, so a browser
-    // on our origin cannot poll for the token.
     requiresClientSecret: false,
     publicClientId: 'opencode-cli',
+    deviceUserAgent: 'opencode/cli',
   },
   github: {
     id: 'github',

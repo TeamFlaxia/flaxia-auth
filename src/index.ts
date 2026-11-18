@@ -7,7 +7,17 @@ import { isCreatableSrpKdf, isSupportedSrpKdf, isValidVerifier, serverStep1, ser
 import { originAllowed } from './origin';
 import { handleVaultRequest, importVault, validateVaultRewrap } from './vault';
 import { createOAuthApp, createOAuthBridgeApp } from './oauth';
-import { handleComplete, handleDelete, handleExchange, handleList, handleStart, handleCallback } from './oauth/routes';
+import {
+  handleCallback,
+  handleComplete,
+  handleDelete,
+  handleDevicePoll,
+  handleDeviceRefresh,
+  handleDeviceStart,
+  handleExchange,
+  handleList,
+  handleStart,
+} from './oauth/routes';
 import type { ConnectionContext } from './oauth/routes';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -1064,6 +1074,24 @@ const connectionContext = (c: any): ConnectionContext => ({
 });
 
 app.post('/api/connections/:provider/start', c => handleStart(connectionContext(c), c.req.param('provider')));
+app.post('/api/connections/:provider/device/start', async c => {
+  let body: Record<string, unknown>;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'Invalid request' }, 400);
+  return handleDeviceStart(connectionContext(c), c.req.param('provider'), body);
+});
+app.post('/api/connections/:provider/device/poll', async c => {
+  let body: Record<string, unknown>;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'Invalid request' }, 400);
+  return handleDevicePoll(connectionContext(c), c.req.param('provider'), body);
+});
+app.post('/api/connections/:provider/device/refresh', async c => {
+  let body: Record<string, unknown>;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'Invalid request' }, 400);
+  return handleDeviceRefresh(connectionContext(c), c.req.param('provider'), body);
+});
 app.get('/api/connections/:provider/callback', c =>
   handleCallback(connectionContext(c), c.req.param('provider'), new URL(c.req.url).searchParams));
 app.post('/api/connections/:provider/exchange', async c => {

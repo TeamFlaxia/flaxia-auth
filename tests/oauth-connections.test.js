@@ -5,7 +5,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { generateSalt, computeVerifier, clientStep1, clientStep2 } from '../src/srp.ts';
+import { openSealed } from '../src/oauth/seal.ts';
 
 const wrangler = join(process.cwd(), 'node_modules', 'wrangler', 'bin', 'wrangler.js');
 const encode = bytes => Buffer.from(bytes).toString('base64');
@@ -415,4 +417,252 @@ test('a server-exchange provider refuses a browser exchange and seals the result
   } else {
     assert.equal(exchanged.status, 502);
   }
+});
+
+test('the OpenCode device flow polls on the server and seals the tokens', { timeout: 120000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'flaxia-opencode-device-test-'));
+  t.after(async () => { await rm(directory, { recursive: true, force: true }); });
+  const migration = spawnSync(
+    process.execPath,
+    [wrangler, 'd1', 'migrations', 'apply', 'flaxia-auth-prod', '--local', '--persist-to', directory],
+    { encoding: 'utf8', env: { ...process.env, CI: 'true' } },
+  );
+  assert.equal(migration.status, 0, migration.stdout + migration.stderr);
+
+  // A fake Console: the first poll is pending, the second issues a token.
+  let polls = 0;
+  const consoleServer = createHttpServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    const json = (status, body) => {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    if (req.method === 'POST' && req.url === '/auth/device/code') {
+      json(200, {
+        device_code: 'device-code-123',
+        user_code: 'ABCD-EFGH',
+        verification_uri: 'https://opencode.ai/console/device',
+        verification_uri_complete: 'https://opencode.ai/console/device?user_code=ABCD-EFGH',
+        expires_in: 600,
+        interval: 1,
+      });
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/auth/device/token') {
+      const body = JSON.parse(raw);
+      if (body.grant_type === 'refresh_token') {
+        json(200, {
+          access_token: 'oc_access_refreshed',
+          refresh_token: 'oc_refresh_2',
+          expires_in: 3600,
+          token_type: 'Bearer',
+          scope: 'inference',
+        });
+        return;
+      }
+      polls += 1;
+      if (polls === 1) {
+        json(400, { error: 'authorization_pending' });
+        return;
+      }
+      json(200, {
+        access_token: 'oc_access',
+        refresh_token: 'oc_refresh',
+        expires_in: 3600,
+        token_type: 'Bearer',
+        scope: 'inference',
+      });
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/api/orgs') {
+      json(200, [{ id: 'org_test', name: 'Test Workspace' }]);
+      return;
+    }
+    json(404, {});
+  });
+  await new Promise((resolve, reject) => {
+    consoleServer.once('error', reject);
+    consoleServer.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise(resolve => consoleServer.close(resolve));
+  });
+  const consoleOrigin = `http://127.0.0.1:${consoleServer.address().port}`;
+
+  const port = await freePort();
+  const auth = await startWorker(
+    [
+      '--port', String(port),
+      '--persist-to', directory,
+      '--var', `OPENCODE_CONSOLE_ORIGIN:${consoleOrigin}`,
+    ],
+    'auth',
+  );
+  t.after(async () => {
+    if (auth.worker.exitCode === null) {
+      auth.worker.kill('SIGTERM');
+      await new Promise(resolve => auth.worker.once('exit', resolve));
+    }
+  });
+  const base = `http://127.0.0.1:${port}`;
+  await waitFor(`${base}/health`, auth.worker, auth.getOutput, 'Auth');
+
+  const request = (path, { method = 'POST', body, cookie, origin = 'https://studio.flaxia.app', ip = '192.0.2.205' } = {}) =>
+    fetch(`${base}${path}`, {
+      method,
+      redirect: 'manual',
+      headers: {
+        origin,
+        'CF-Connecting-IP': ip,
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        ...(cookie ? { cookie } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+  const password = 'opencode device password';
+  const salt = generateSalt();
+  const registration = await request('/api/auth/register', {
+    body: {
+      username: 'DeviceUser',
+      display_name: 'Device User',
+      srp_salt: encode(salt),
+      srp_verifier: encode(await computeVerifier(password, salt)),
+      srp_group: '2048',
+      srp_kdf: 'pbkdf2-600k-v2',
+    },
+  });
+  assert.equal(registration.status, 201, await registration.clone().text());
+  const cookie = registration.headers.get('set-cookie').split(';')[0];
+
+  // The Vault has to be enabled before the connection can point at an item.
+  const reauthProof = async () => {
+    const start = await request('/api/auth/reauth/start', { cookie });
+    const challenge = await start.json();
+    const first = await clientStep1(password, Uint8Array.from(Buffer.from(challenge.salt, 'base64')));
+    const proof = await clientStep2(
+      password,
+      Uint8Array.from(Buffer.from(challenge.salt, 'base64')),
+      first.a,
+      Uint8Array.from(Buffer.from(challenge.B, 'base64')),
+      challenge.srp_kdf,
+    );
+    return { challenge_id: challenge.challenge_id, A: encode(proof.A), M1: encode(proof.M1) };
+  };
+  const enabled = await request('/api/vault/keys', {
+    cookie,
+    body: { ...envelope(), current_srp: await reauthProof() },
+  });
+  assert.equal(enabled.status, 201, await enabled.clone().text());
+
+  // The regular authorization start refuses a device-flow provider.
+  const wrongStart = await request('/api/connections/opencode/start', {
+    cookie,
+    body: { state: 'd'.repeat(43), code_challenge: 'c'.repeat(43) },
+  });
+  assert.equal(wrongStart.status, 400);
+
+  const state = 'd'.repeat(43);
+  const started = await request('/api/connections/opencode/device/start', {
+    cookie,
+    body: { state },
+  });
+  assert.equal(started.status, 200, await started.clone().text());
+  const start = await started.json();
+  assert.equal(start.user_code, 'ABCD-EFGH');
+  assert.equal(start.device_code, 'device-code-123');
+  assert.equal(start.interval, 1);
+  assert.equal('access_token' in start, false);
+  assert.equal(JSON.stringify(start).includes('oc_access'), false);
+
+  // Pending is a normal answer, not an error.
+  const pending = await request('/api/connections/opencode/device/poll', {
+    cookie,
+    body: {
+      transaction_id: start.transaction_id,
+      state,
+      device_code: start.device_code,
+      client_public_key: 'not-a-key-yet',
+    },
+  });
+  assert.equal(pending.status, 200, await pending.clone().text());
+  assert.deepEqual(await pending.json(), { status: 'pending' });
+
+  const keys = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  const publicKey = encode(new Uint8Array(await crypto.subtle.exportKey('spki', keys.publicKey)));
+  const completed = await request('/api/connections/opencode/device/poll', {
+    cookie,
+    body: {
+      transaction_id: start.transaction_id,
+      state,
+      device_code: start.device_code,
+      client_public_key: publicKey,
+    },
+  });
+  assert.equal(completed.status, 200, await completed.clone().text());
+  const result = await completed.json();
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(result.orgs, [{ id: 'org_test', name: 'Test Workspace' }]);
+  assert.ok(result.sealed);
+  assert.equal(JSON.stringify(result).includes('oc_access'), false);
+
+  const opened = await openSealed(result.sealed, keys.privateKey);
+  const token = JSON.parse(new TextDecoder().decode(opened));
+  assert.equal(token.access_token, 'oc_access');
+  assert.equal(token.refresh_token, 'oc_refresh');
+
+  // A transaction is exchanged exactly once.
+  const replay = await request('/api/connections/opencode/device/poll', {
+    cookie,
+    body: {
+      transaction_id: start.transaction_id,
+      state,
+      device_code: start.device_code,
+      client_public_key: publicKey,
+    },
+  });
+  assert.equal(replay.status, 400);
+
+  // Metadata is linked to the client-encrypted Vault item.
+  const vaultItemId = `item_${'f'.repeat(20)}`;
+  const saved = await request(`/api/vault/items/${vaultItemId}`, {
+    method: 'PUT',
+    cookie,
+    body: { item_key_wrapped: wrapped(), payload: wrapped(120), kind: 'oauth_connection', vk_version: 1 },
+  });
+  assert.equal(saved.status, 200, await saved.clone().text());
+  const connection = await request('/api/connections/opencode/complete', {
+    cookie,
+    body: {
+      transaction_id: start.transaction_id,
+      state,
+      vault_item_id: vaultItemId,
+      scopes: ['inference'],
+      expires_at: '2026-11-18T12:00:00.000Z',
+      refresh_expires_at: '2026-12-18T12:00:00.000Z',
+    },
+  });
+  assert.equal(connection.status, 200, await connection.clone().text());
+  const listed = await (await request('/api/connections', { method: 'GET', cookie })).json();
+  assert.equal(listed.connections.length, 1);
+  assert.equal(listed.connections[0].provider, 'opencode');
+  assert.deepEqual(listed.connections[0].scopes, ['inference']);
+  assert.equal(listed.connections[0].vault_item_id, vaultItemId);
+  assert.equal(JSON.stringify(listed).includes('oc_access'), false);
+
+  // Refresh goes through Auth and is sealed too. It requires a linked
+  // connection, because Auth must not act as a refresh oracle for anyone.
+  const refreshed = await request('/api/connections/opencode/device/refresh', {
+    cookie,
+    body: { refresh_token: token.refresh_token, client_public_key: publicKey },
+  });
+  assert.equal(refreshed.status, 200, await refreshed.clone().text());
+  const refreshedJson = await refreshed.json();
+  assert.ok(refreshedJson.sealed);
+  assert.equal(JSON.stringify(refreshedJson).includes('oc_access_refreshed'), false);
+  const refreshedToken = JSON.parse(new TextDecoder().decode(
+    await openSealed(refreshedJson.sealed, keys.privateKey),
+  ));
+  assert.equal(refreshedToken.access_token, 'oc_access_refreshed');
 });

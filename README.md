@@ -12,7 +12,7 @@ Flaxia向けの認証サービスです。Cloudflare Workers、Hono、TypeScript
 - `HttpOnly` / `Secure` / `SameSite=Lax` のセッションCookie、ログアウト、Origin検証、レート制限
 - ブラウザ生成の復旧コードによるアカウント復旧
 - Authが管理するPersonal Vault（暗号化された鍵、アイテム、端末ペアリング）
-- 外部サービスへのOAuth接続（トークンはブラウザが保持し、Authは暗号文のみ保存）
+- 外部サービスへのOAuth接続（トークンはブラウザが保持し、Authは暗号文のみ保存）。OpenCodeはRFC 8628のデバイスフローに対応
 - FlaxiaとのService Binding連携（プロビジョニング、セッション交換、グラント失効、パスワード・メール変更、凍結、削除）
 - OAuth 2.0 / OpenID Connect プロバイダー（認可コード + PKCE、IDトークン、UserInfo、リフレッシュトークン、失効、ディスカバリ、JWKS）
 - 期限切れのセッション、認可コード、レガシーフィンガープリント、削除キャンセル、メール変更記録、Vault端末ペアリング、OAuthコード・トークン・接続トランザクションの毎時クリーンアップ
@@ -101,6 +101,9 @@ npx wrangler d1 migrations apply flaxia-auth-prod --remote
 | GET | `/api/connections/:provider/callback` | プロバイダからの戻りを処理 |
 | GET | `/api/connections` | 接続一覧（メタデータのみ） |
 | POST | `/api/connections/:provider/exchange` | 方式Sのトークン交換（結果をsealして返す） |
+| POST | `/api/connections/:provider/device/start` | デバイス認可の開始（RFC 8628、OpenCode） |
+| POST | `/api/connections/:provider/device/poll` | デバイス認可のポーリングとトークンのseal |
+| POST | `/api/connections/:provider/device/refresh` | リフレッシュトークンの交換とseal |
 | POST | `/api/connections/:provider/complete` | 接続のメタデータを記録 |
 | DELETE | `/api/connections/:provider` | 接続を破棄 |
 

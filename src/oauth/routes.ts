@@ -2,17 +2,20 @@
 //
 // Two rules shape everything here:
 //
-//   1. Auth never holds a token. A browser-reachable provider exchanges the
+//   1. Auth never stores a token. A browser-reachable provider exchanges the
 //      code itself and encrypts the result into the Vault. For a provider
-//      that refuses cross-origin calls, Auth performs the exchange and seals
-//      the result to a client public key, so the plaintext exists in memory
-//      for one request and is never stored.
+//      that refuses cross-origin calls, or only implements the device grant,
+//      Auth performs the exchange/poll and seals the result to a client
+//      public key, so the plaintext exists in memory for one request and is
+//      never stored.
 //
 //   2. The callback carries no credential. It carries the authorization code
-//      and the state, both of which are single-use and short-lived.
+//      and the state, both of which are single-use and short-lived. The
+//      device flow has no callback at all: the browser keeps the device code
+//      and Auth stores only the transaction.
 
 import { getCookie } from 'hono/cookie';
-import { getProvider } from './registry.ts';
+import { getProvider, type OAuthProvider } from './registry.ts';
 import { hashState, isValidCodeVerifier, isValidState, newTransaction, transactionExpired, transactionFromRow } from './flow.ts';
 import { isValidProviderSub, parseConnectionMetadata } from './store.ts';
 import { sealTo } from './seal.ts';
@@ -38,7 +41,12 @@ const CALLBACK_PATH = '/api/connections';
 /** Where the browser returns after an authorization. */
 const RETURN_URIS = [
   'https://flaxia.app/settings/connections',
+  'https://studio.flaxia.app/',
   'http://localhost:3000/settings/connections',
+  'http://localhost:4173/',
+  'http://127.0.0.1:4173/',
+  'http://localhost:4174/',
+  'http://127.0.0.1:4174/',
   'http://localhost:8787/settings/connections',
   'http://localhost:8788/settings/connections',
 ] as const;
@@ -53,6 +61,95 @@ const providerId = (value: string | undefined): string | null => {
 };
 
 const callbackUri = (provider: string): string => `${AUTH_ORIGIN}${CALLBACK_PATH}/${provider}/callback`;
+
+// RFC 8628 device authorization grant. The browser keeps the device code and
+// asks Auth to poll; Auth never persists the device code or the token.
+const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
+
+interface DeviceEndpoints {
+  server: string;
+  code: string;
+  token: string;
+  orgs: string;
+}
+
+/**
+ * The device endpoints for a provider. `OPENCODE_CONSOLE_ORIGIN` exists for
+ * integration tests (and self-hosted consoles); production never sets it.
+ * Every path is relative to the Console root, as in the OpenCode client.
+ */
+const deviceEndpoints = (env: ConnectionEnv, definition: OAuthProvider): DeviceEndpoints | null => {
+  if (definition.mode !== 'device' || !definition.deviceServer) return null;
+  const override = definition.id === 'opencode' && typeof env.OPENCODE_CONSOLE_ORIGIN === 'string'
+    ? env.OPENCODE_CONSOLE_ORIGIN
+    : null;
+  const server = (override ?? definition.deviceServer).replace(/\/+$/, '');
+  if (!server) return null;
+  return {
+    server,
+    code: `${server}/auth/device/code`,
+    token: `${server}/auth/device/token`,
+    orgs: `${server}/api/orgs`,
+  };
+};
+
+/** Parse a token response that may be JSON or form-encoded. */
+const parseTokenBody = (text: string): Record<string, unknown> | null => {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Fall through to the form encoding some providers still return.
+  }
+  const form = new URLSearchParams(text);
+  const entries = Object.fromEntries(form.entries());
+  return Object.keys(entries).length > 0 ? entries : null;
+};
+
+const boundedString = (value: unknown, maxLength: number): string | null =>
+  typeof value === 'string' && value.length > 0 && value.length <= maxLength ? value : null;
+
+const isHttpsUrl = (value: string): boolean => {
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+/** Device verification URIs may be relative to the Console. */
+const resolveHttpsUrl = (value: string, base: string): string | null => {
+  try {
+    const url = new URL(value, base);
+    return url.protocol === 'https:' ? url.toString() : null;
+  } catch {
+    return null;
+  }
+};
+
+/** Workspace metadata from the Console. Never a credential, so it is not sealed. */
+const parseOrgs = (value: unknown): Array<{ id: string; name: string }> => {
+  const list = Array.isArray(value)
+    ? value
+    : value && typeof value === 'object' && Array.isArray((value as { orgs?: unknown }).orgs)
+      ? (value as { orgs: unknown[] }).orgs
+      : [];
+  const orgs: Array<{ id: string; name: string }> = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    const id = boundedString(record.id, 128);
+    if (!id) continue;
+    const name = typeof record.name === 'string' && record.name.length > 0
+      ? record.name.slice(0, 128)
+      : id;
+    orgs.push({ id, name });
+    if (orgs.length === 20) break;
+  }
+  return orgs;
+};
 
 /** The PKCE challenge for a verifier, base64url without padding. */
 const codeChallenge = async (verifier: string): Promise<string> => {
@@ -81,6 +178,9 @@ const clientIdFor = (env: ConnectionEnv, providerId: string): string | null => {
 export async function handleStart(ctx: ConnectionContext, providerParam: string | undefined): Promise<Response> {
   const provider = providerId(providerParam);
   if (!provider) return ctx.json({ error: 'Unknown provider' }, 404);
+  if (getProvider(provider)?.mode === 'device') {
+    return ctx.json({ error: 'Provider uses the device flow' }, 400);
+  }
   const session = ctx.cookie('__Host-flaxia_session');
   const user = await ctx.sessionUser(session);
   if (!user || !session) return ctx.json({ error: 'Unauthenticated' }, 401);
@@ -356,6 +456,323 @@ export async function handleExchange(ctx: ConnectionContext, providerParam: stri
 }
 
 /**
+ * Handle `POST /api/connections/:provider/device/start`.
+ *
+ * Auth asks the provider for a device code. The browser receives the user
+ * code to display and the device code to hold; Auth stores only a
+ * transaction and the hash of the browser's state. There is no callback and
+ * no client secret.
+ */
+export async function handleDeviceStart(
+  ctx: ConnectionContext,
+  providerParam: string | undefined,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const provider = providerId(providerParam);
+  if (!provider) return ctx.json({ error: 'Unknown provider' }, 404);
+  const definition = getProvider(provider)!;
+  if (definition.mode !== 'device') return ctx.json({ error: 'Provider does not use the device flow' }, 400);
+
+  const session = ctx.cookie('__Host-flaxia_session');
+  const user = await ctx.sessionUser(session);
+  if (!user || !session) return ctx.json({ error: 'Unauthenticated' }, 401);
+  if (await ctx.rateLimit(`oauth-device-start:user:${user.id}`, 10)) {
+    return ctx.json({ error: 'Too many requests' }, 429);
+  }
+
+  const state = body.state;
+  if (!isValidState(state)) return ctx.json({ error: 'Invalid request' }, 400);
+
+  const endpoints = deviceEndpoints(ctx.env, definition);
+  if (!endpoints) return ctx.json({ error: 'Provider is not configured' }, 503);
+  const clientId = clientIdFor(ctx.env, provider);
+  if (!clientId) return ctx.json({ error: 'Provider is not configured' }, 503);
+
+  let response: Response;
+  try {
+    response = await fetch(endpoints.code, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(definition.deviceUserAgent ? { 'User-Agent': definition.deviceUserAgent } : {}),
+      },
+      body: JSON.stringify({ client_id: clientId, ...definition.deviceCodeParams }),
+    });
+  } catch {
+    return ctx.json({ error: 'Provider is unreachable' }, 502);
+  }
+  const text = await response.text();
+  const grant = parseTokenBody(text);
+  if (!response.ok || !grant) return ctx.json({ error: 'Provider rejected the device authorization' }, 502);
+
+  const deviceCode = boundedString(grant.device_code, 4096);
+  const userCode = boundedString(grant.user_code, 64);
+  if (!deviceCode || !userCode) {
+    return ctx.json({ error: 'Provider returned an invalid response' }, 502);
+  }
+  // Relative verification URIs resolve against the Console root, not the
+  // device endpoint path, so `device?user_code=…` does not land under /auth/.
+  const consoleBase = `${endpoints.server}/`;
+  const verificationUriRaw =
+    resolveHttpsUrl(boundedString(grant.verification_uri, 2048) ?? definition.authorizeUrl, consoleBase) ??
+    definition.authorizeUrl;
+  if (!isHttpsUrl(verificationUriRaw)) {
+    return ctx.json({ error: 'Provider returned an invalid response' }, 502);
+  }
+  const completeRaw = boundedString(grant.verification_uri_complete, 2048);
+  const verificationUriComplete = completeRaw ? resolveHttpsUrl(completeRaw, consoleBase) : null;
+  const expiresIn = typeof grant.expires_in === 'number' && Number.isInteger(grant.expires_in) &&
+      grant.expires_in >= 1 && grant.expires_in <= 3600
+    ? grant.expires_in
+    : 600;
+  const interval = typeof grant.interval === 'number' && Number.isInteger(grant.interval) &&
+      grant.interval >= 1 && grant.interval <= 60
+    ? grant.interval
+    : 5;
+
+  // The device grant has no callback, so the transaction is already consumed.
+  const transaction = await newTransaction({
+    userId: user.id,
+    provider,
+    state,
+    redirectUri: '',
+  });
+  const now = new Date().toISOString();
+  await ctx.env.DB.prepare('DELETE FROM oauth_transactions WHERE expires_at <= ?').bind(now).run();
+  await ctx.env.DB.prepare(
+    `INSERT INTO oauth_transactions (id, user_id, provider, state_hash, code_verifier_hash, redirect_uri, return_uri, expires_at, consumed_at)
+     VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, ?)`,
+  )
+    .bind(
+      transaction.id,
+      user.id,
+      provider,
+      transaction.state_hash,
+      transaction.redirect_uri,
+      transaction.expires_at,
+      now,
+    )
+    .run();
+
+  // The device code is a one-time secret held by the browser. Auth does not
+  // store it: the session, the transaction and the state bind the poll.
+  return ctx.json({
+    transaction_id: transaction.id,
+    device_code: deviceCode,
+    user_code: userCode,
+    verification_uri: verificationUriRaw,
+    verification_uri_complete: verificationUriComplete,
+    expires_in: expiresIn,
+    interval,
+  });
+}
+
+/**
+ * Handle `POST /api/connections/:provider/device/poll`.
+ *
+ * The browser polls this route; Auth polls the provider. A pending answer is
+ * not an error. On success the raw token response is sealed to the client's
+ * public key and the transaction is used exactly once.
+ */
+export async function handleDevicePoll(
+  ctx: ConnectionContext,
+  providerParam: string | undefined,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const provider = providerId(providerParam);
+  if (!provider) return ctx.json({ error: 'Unknown provider' }, 404);
+  const definition = getProvider(provider)!;
+  if (definition.mode !== 'device') return ctx.json({ error: 'Provider does not use the device flow' }, 400);
+
+  const session = ctx.cookie('__Host-flaxia_session');
+  const user = await ctx.sessionUser(session);
+  if (!user || !session) return ctx.json({ error: 'Unauthenticated' }, 401);
+  // The provider asks for a 5 s interval; 120 per minute leaves room for a
+  // slow_down without letting one account hammer the provider.
+  if (await ctx.rateLimit(`oauth-device-poll:user:${user.id}`, 120)) {
+    return ctx.json({ error: 'Too many requests' }, 429);
+  }
+
+  const transactionId = boundedString(body.transaction_id, 96);
+  const state = body.state;
+  const deviceCode = boundedString(body.device_code, 4096);
+  const clientPublicKey = boundedString(body.client_public_key, 4096);
+  if (!transactionId || !isValidState(state) || !deviceCode || !clientPublicKey) {
+    return ctx.json({ error: 'Invalid request' }, 400);
+  }
+  // The interval the browser is currently polling at, so `slow_down` can add
+  // 5 seconds to it as RFC 8628 requires. Defaults to the RFC's 5 seconds.
+  const pollInterval = typeof body.interval === 'number' && Number.isInteger(body.interval) &&
+      body.interval >= 1 && body.interval <= 60
+    ? body.interval
+    : 5;
+
+  const row = await ctx.env.DB.prepare(
+    `SELECT id, user_id, provider, state_hash, code_verifier_hash, redirect_uri, return_uri, expires_at, consumed_at, exchanged_at, completed_at
+     FROM oauth_transactions WHERE id = ? AND provider = ? AND user_id = ? LIMIT 1`,
+  ).bind(transactionId, provider, user.id).first();
+  const transaction = transactionFromRow(row);
+  if (!transaction || transaction.provider !== provider || transaction.user_id !== user.id) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  if (transaction.state_hash !== await hashState(state)) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+  const now = new Date().toISOString();
+  if (transaction.consumed_at === null || transaction.exchanged_at !== null || transactionExpired(transaction, now)) {
+    return ctx.json({ error: 'Invalid transaction' }, 400);
+  }
+
+  const endpoints = deviceEndpoints(ctx.env, definition);
+  const clientId = clientIdFor(ctx.env, provider);
+  if (!endpoints || !clientId) return ctx.json({ error: 'Provider is not configured' }, 503);
+
+  let response: Response;
+  try {
+    response = await fetch(endpoints.token, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(definition.deviceUserAgent ? { 'User-Agent': definition.deviceUserAgent } : {}),
+      },
+      body: JSON.stringify({
+        client_id: clientId,
+        grant_type: DEVICE_GRANT,
+        device_code: deviceCode,
+      }),
+    });
+  } catch {
+    return ctx.json({ error: 'Provider is unreachable' }, 502);
+  }
+  const text = await response.text();
+  const token = parseTokenBody(text);
+  if (!token) return ctx.json({ error: 'Provider returned an invalid response' }, 502);
+
+  const error = typeof token.error === 'string' ? token.error : null;
+  if (error) {
+    if (error === 'authorization_pending') return ctx.json({ status: 'pending' });
+    if (error === 'slow_down') return ctx.json({ status: 'slow_down', interval: Math.min(60, pollInterval + 5) });
+    if (error === 'access_denied') return ctx.json({ status: 'access_denied' }, 403);
+    if (error === 'expired_token') return ctx.json({ status: 'expired' }, 400);
+    return ctx.json({ error: 'Provider rejected the device authorization' }, 502);
+  }
+  if (!response.ok || typeof token.access_token !== 'string') {
+    return ctx.json({ error: 'Provider rejected the device authorization' }, 502);
+  }
+
+  const reserved = await ctx.env.DB.prepare(
+    `UPDATE oauth_transactions SET exchanged_at = ?
+     WHERE id = ? AND exchanged_at IS NULL AND consumed_at IS NOT NULL AND expires_at > ?`,
+  ).bind(now, transaction.id, now).run();
+  if (reserved.meta.changes !== 1) return ctx.json({ error: 'Invalid transaction' }, 400);
+
+  const releaseExchange = async (): Promise<void> => {
+    await ctx.env.DB.prepare('UPDATE oauth_transactions SET exchanged_at = NULL WHERE id = ? AND exchanged_at = ?')
+      .bind(transaction.id, now).run();
+  };
+
+  // Workspace metadata is not a credential, so it travels outside the seal.
+  // A failed lookup must not fail the connection.
+  let orgs: Array<{ id: string; name: string }> = [];
+  try {
+    const orgResponse = await fetch(endpoints.orgs, {
+      headers: {
+        Authorization: `Bearer ${token.access_token}`,
+        Accept: 'application/json',
+        ...(definition.deviceUserAgent ? { 'User-Agent': definition.deviceUserAgent } : {}),
+      },
+    });
+    if (orgResponse.ok) orgs = parseOrgs(await orgResponse.json());
+  } catch {
+    // Workspace selection stays available on the next request.
+  }
+
+  let sealed: Awaited<ReturnType<typeof sealTo>>;
+  try {
+    sealed = await sealTo(new TextEncoder().encode(text), clientPublicKey);
+  } catch {
+    await releaseExchange();
+    return ctx.json({ error: 'Invalid client public key' }, 400);
+  }
+  return ctx.json({ status: 'complete', sealed, orgs });
+}
+
+/**
+ * Handle `POST /api/connections/:provider/device/refresh`.
+ *
+ * The browser decrypts the refresh token from its Vault and sends it here
+ * only for the duration of the exchange. The refreshed token response is
+ * sealed to the client's public key and never stored.
+ */
+export async function handleDeviceRefresh(
+  ctx: ConnectionContext,
+  providerParam: string | undefined,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const provider = providerId(providerParam);
+  if (!provider) return ctx.json({ error: 'Unknown provider' }, 404);
+  const definition = getProvider(provider)!;
+  if (definition.mode !== 'device') return ctx.json({ error: 'Provider does not use the device flow' }, 400);
+
+  const session = ctx.cookie('__Host-flaxia_session');
+  const user = await ctx.sessionUser(session);
+  if (!user || !session) return ctx.json({ error: 'Unauthenticated' }, 401);
+  if (await ctx.rateLimit(`oauth-device-refresh:user:${user.id}`, 20)) {
+    return ctx.json({ error: 'Too many requests' }, 429);
+  }
+  // A refresh only makes sense for a connection this user already linked.
+  // Auth still cannot verify that the token matches the Vault item (it never
+  // sees the item), but it refuses to act as a refresh oracle for userless
+  // requests.
+  const connection = await ctx.env.DB.prepare(
+    "SELECT id FROM oauth_connections WHERE user_id = ? AND provider = ? AND status = 'active' LIMIT 1",
+  ).bind(user.id, provider).first();
+  if (!connection) return ctx.json({ error: 'No active connection' }, 400);
+
+  const refreshToken = boundedString(body.refresh_token, 4096);
+  const clientPublicKey = boundedString(body.client_public_key, 4096);
+  if (!refreshToken || !clientPublicKey) return ctx.json({ error: 'Invalid request' }, 400);
+
+  const endpoints = deviceEndpoints(ctx.env, definition);
+  const clientId = clientIdFor(ctx.env, provider);
+  if (!endpoints || !clientId) return ctx.json({ error: 'Provider is not configured' }, 503);
+
+  let response: Response;
+  try {
+    response = await fetch(endpoints.token, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(definition.deviceUserAgent ? { 'User-Agent': definition.deviceUserAgent } : {}),
+      },
+      body: JSON.stringify({
+        client_id: clientId,
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+      }),
+    });
+  } catch {
+    return ctx.json({ error: 'Provider is unreachable' }, 502);
+  }
+  const text = await response.text();
+  const token = parseTokenBody(text);
+  if (!response.ok || !token || typeof token.access_token !== 'string' || typeof token.error === 'string') {
+    return ctx.json({ error: 'Provider rejected the refresh' }, 502);
+  }
+
+  let sealed: Awaited<ReturnType<typeof sealTo>>;
+  try {
+    sealed = await sealTo(new TextEncoder().encode(text), clientPublicKey);
+  } catch {
+    return ctx.json({ error: 'Invalid client public key' }, 400);
+  }
+  return ctx.json({ sealed });
+}
+
+/**
  * Handle `POST /api/connections/:provider/complete`.
  *
  * The browser encrypted the token with its Vault key and stored it as an
@@ -397,7 +814,7 @@ export async function handleComplete(ctx: ConnectionContext, providerParam: stri
   if (transaction.consumed_at === null || transaction.completed_at !== null || transactionExpired(transaction, now)) {
     return ctx.json({ error: 'Invalid transaction' }, 400);
   }
-  if (definition.mode === 'server_exchange' && transaction.exchanged_at === null) {
+  if ((definition.mode === 'server_exchange' || definition.mode === 'device') && transaction.exchanged_at === null) {
     return ctx.json({ error: 'Transaction has not been exchanged' }, 400);
   }
 

@@ -47,7 +47,20 @@ test('client-mode providers need no client secret', () => {
 
 test('server-exchange providers are the ones a browser cannot drive', () => {
   const server = PROVIDER_IDS.filter(id => providerMode(id) === 'server_exchange');
-  assert.deepEqual(server.sort(), ['github', 'line', 'opencode', 'x']);
+  assert.deepEqual(server.sort(), ['github', 'line', 'x']);
+});
+
+test('device-flow providers use RFC 8628 instead of a redirect', () => {
+  const device = PROVIDER_IDS.filter(id => providerMode(id) === 'device');
+  assert.deepEqual(device.sort(), ['opencode']);
+  for (const id of device) {
+    const provider = getProvider(id)!;
+    assert.ok(provider.deviceServer, id);
+    assert.deepEqual(provider.deviceCodeParams, { supports_org_scope: true }, id);
+    assert.equal(new URL(provider.deviceServer!).protocol, 'https:', id);
+    assert.equal(provider.requiresClientSecret, false, id);
+    assert.ok(provider.publicClientId || provider.clientIdEnv, id);
+  }
 });
 
 test('a provider that needs a secret says so and names the secret', () => {
@@ -89,18 +102,18 @@ test('only providers a browser can actually reach are client mode', () => {
     github: { reachable: false, secretFree: false },
     x: { reachable: false, secretFree: false },
     // The Console answers with a fixed `Access-Control-Allow-Origin:
-    // https://opencode.ai`, which is not our origin.
+    // https://opencode.ai`, which is not our origin. It also only offers the
+    // device grant, so Auth polls for the token on the browser's behalf.
     opencode: { reachable: false, secretFree: true },
   } as const;
   for (const [id, facts] of Object.entries(measured)) {
     const provider = getProvider(id);
     assert.ok(provider, id);
     assert.equal(provider.requiresClientSecret, !facts.secretFree, `${id}: secret requirement`);
-    assert.equal(
-      provider.mode,
-      facts.reachable && facts.secretFree ? 'client' : 'server_exchange',
-      `${id}: ${JSON.stringify(facts)}`,
-    );
+    const expected = id === 'opencode'
+      ? 'device'
+      : facts.reachable && facts.secretFree ? 'client' : 'server_exchange';
+    assert.equal(provider.mode, expected, `${id}: ${JSON.stringify(facts)}`);
   }
 });
 
